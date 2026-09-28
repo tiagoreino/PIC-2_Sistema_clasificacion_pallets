@@ -1,0 +1,66 @@
+// Salidas
+#define Actuador PD5
+#define Cinta PD6
+#define LedRojo PB1
+#define LedVerde PB0
+#define Buzzer PB2
+
+// Entradas
+#define Conforme PC0
+#define NoConforme PC4
+
+// Funcion para hacer pitidos
+void pitidos(uint8_t n) {
+  for (uint8_t i = 0; i < n; i++) {
+    PORTB |= (1 << Buzzer);
+    delay(1500);
+    PORTB &= ~(1 << Buzzer);
+    delay(150);
+  }
+}
+
+void setup()
+{
+  DDRC &= ~((1 << Conforme) | (1 << NoConforme));            // entradas
+  DDRB |= (1 << LedRojo) | (1 << LedVerde) | (1 << Buzzer);  // salidas
+  DDRD |= (1 << Actuador) | (1 << Cinta);                    // salidas
+}
+
+void loop()
+{
+  
+  //simula movimiento de la cinta
+  PORTD |= (1 << Cinta);
+  delay(1500);
+  PORTD &= ~(1 << Cinta);
+  
+  //simula estacion de verificacion
+  PORTB |= (1 << LedRojo) | (1 << LedVerde);
+  pitidos(1);
+
+  uint8_t ok, no;
+  do {                                  // espera hasta que haya exactamente una senal
+    ok = (PINC >> Conforme) & 1;
+    no = (PINC >> NoConforme) & 1;
+  } while (ok == no);                   // 0-0 espera, 1-1 invalido tambien espera
+
+  //si el pallet es valido
+  if (ok) {
+    PORTB &= ~(1 << LedRojo);
+    pitidos(1);
+    PORTD |= (1 << Cinta);
+    delay(3500); //sigue su camino
+  } else { // si es invalido
+    PORTB &= ~(1 << LedVerde);
+    pitidos(2);
+    PORTD |= (1 << Cinta);
+    delay(2500);
+    PORTD &= ~(1 << Cinta);
+    PORTD |= (1 << Actuador);
+    delay(1500); // se simula el descarte
+    PORTD &= ~(1 << Actuador);
+  }
+
+  // espera a que baje la senal antes del siguiente ciclo
+  while (PINC & ((1 << Conforme) | (1 << NoConforme))) {}
+}
