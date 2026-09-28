@@ -1,8 +1,7 @@
 import socket
 import struct
 
-# Poné acá la IP real de tu ESP32-CAM
-ESP32_IP = "192.168.1.15"  # <--- Asegurate de que sea la correcta
+ESP32_IP = "192.168.1.8"  
 PORT = 5000
 
 def request_photo():
