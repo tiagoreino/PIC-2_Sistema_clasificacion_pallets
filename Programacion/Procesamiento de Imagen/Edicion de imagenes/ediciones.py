@@ -2,6 +2,8 @@ from PIL import Image
 from PIL import ImageEnhance
 from PIL import ImageFilter
 
+#Pruebas sacadas de https://cloudinary.com/guides/image-effects/python-image-manipulation
+
 # Open the image
 img = Image.open(r"c:/Users/tiago/OneDrive/Documentos/UTEC/PIC II/PIC-2_Sistema_clasificacion_pallets/Programacion/Procesamiento de Imagen/mate_de_prueba.jpg")
 
