@@ -1,0 +1,7 @@
+description: A simple JSON (JavasScript Object Notation) generator with flushing capability
+repository: git://github.com/espressif/idf-extra-components.git
+repository_info:
+  commit_sha: 225a1c974215bdf6eeed990c5f9ffe45f883b171
+  path: json_generator
+url: https://github.com/espressif/json_generator
+version: 2.0.0

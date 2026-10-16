@@ -5,21 +5,9 @@ from PIL import Image, ImageTk
 # Función para habilitar o deshabilitar botones segun el modo
 def cambiar_modo():
     if opcion_seleccionada.get() == 1:  # 1 es automatico
-        # Botones de movimiento desactivados
-        boton_avanzar.config(state="disabled")
-        boton_detener.config(state="disabled")
-        boton_retroceder.config(state="disabled")
-        boton_subir.config(state="disabled")
-        boton_bajar.config(state="disabled")
         # Selector de Pallet activado
         elegidor.config(state="readonly")
     else:  # 2 es manual
-        # Botones de movimiento activados
-        boton_avanzar.config(state="normal")
-        boton_detener.config(state="normal")
-        boton_retroceder.config(state="normal")
-        boton_subir.config(state="normal")
-        boton_bajar.config(state="normal")
         # Selector de Pallet desactivado
         elegidor.config(state="disabled")
 
@@ -66,32 +54,7 @@ palletLabel.grid(row=0, column=0, padx=5, pady=5, sticky="w")
 elegidor = ttk.Combobox(conexion_pallet, values=["Pallet 1", "Pallet 2", "Pallet 3"], state="readonly", width=25)
 elegidor.grid(row=0, column=1, padx=5, pady=5)
 elegidor.set("Selecciona tipo de Pallet") 
-
-# Operaciones: Modo Manual 
-modo_manual = Frame(raiz, bg="white", bd=5, relief="groove")
-modo_manual.pack(fill="x", side="top", padx=10, pady=5)
-
-cinta_label = Label(modo_manual, text="Cinta Transportadora:", bg="white", font=("Arial", 10, "bold"))
-cinta_label.grid(row=0, column=0, columnspan=3, padx=5, pady=5, sticky="w")
-
-boton_avanzar = Button(modo_manual, text="Avanzar", bg="blue", fg="white", width=15)
-boton_avanzar.grid(row=1, column=0, padx=5, pady=5)
-
-boton_detener = Button(modo_manual, text="Detener", bg="red", fg="white", width=15)
-boton_detener.grid(row=1, column=1, padx=5, pady=5)
-
-boton_retroceder = Button(modo_manual, text="Retroceder", bg="orange", fg="white", width=15)
-boton_retroceder.grid(row=1, column=2, padx=5, pady=5)
-
-piston_label = Label(modo_manual, text="Pistón:", bg="white", font=("Arial", 10, "bold"))
-piston_label.grid(row=2, column=0, columnspan=3, padx=5, pady=5, sticky="w")
-
-boton_subir = Button(modo_manual, text="Subir", bg="blue", fg="white", width=15)
-boton_subir.grid(row=3, column=0, padx=5, pady=5)
-
-boton_bajar = Button(modo_manual, text="Bajar", bg="red", fg="white", width=15)
-boton_bajar.grid(row=3, column=1, padx=5, pady=5)
-
+           
 # Modos de Opercion
 modo_operacion = Frame(raiz, bg="white", bd=5, relief="groove")
 modo_operacion.pack(fill="x", side="top", padx=10, pady=5)
@@ -142,7 +105,7 @@ cambiar_modo()
 camara_frame = Frame(raiz, bg="black", bd=5, relief="solid")
 camara_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-imagen_pil = Image.open(r"c:/Users/tiago/OneDrive/Documentos/UTEC/PIC II/PIC-2_Sistema_clasificacion_pallets/Programacion/Camara/wifi_camara_test/foto_capturada.jpg")
+imagen_pil = Image.open(r"c:/Users/tiago/OneDrive/Documentos/UTEC/PIC II/PIC-2_Sistema_clasificacion_pallets/Programacion/Camara/camara_detectoraDePallets/foto_capturada.jpg")
 imagen_redimensionada = imagen_pil.resize((560, 260)) 
 miImagen = ImageTk.PhotoImage(imagen_redimensionada)
 
