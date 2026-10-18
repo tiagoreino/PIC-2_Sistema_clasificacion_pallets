@@ -5,58 +5,31 @@ from PIL import Image, ImageTk
 import os
 import subprocess
 import threading
-
-SCRIPT_FOTO = (
-    r"C:\Users\tiago\OneDrive\Documentos\UTEC\PIC II"
-    r"\PIC-2_Sistema_clasificacion_pallets\Programacion"
-    r"\Camara\camara_detectoraDePallets\cliente_foto.py"
-)
-
-PYTHON = r"C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe"
-
+from cliente_foto import request_photo, RUTA_FOTO
+from descubrimiento_camara import descubrir_camaras
 def sacar_foto():
     if opcion_seleccionada.get() != 2:
+        return
+
+    if camara_ip is None:
+        messagebox.showwarning(
+            "Sin cámara",
+            "Primero buscá la cámara con el botón 'Buscar cámara'."
+        )
         return
 
     botonFoto.config(state="disabled", text="Tomando foto...")
 
     def ejecutar():
         try:
-            resultado = subprocess.run(
-                [PYTHON, SCRIPT_FOTO],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=60,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-
-            if resultado.returncode != 0:
-                detalle = resultado.stderr or resultado.stdout
-                raiz.after(
-                    0,
-                    lambda error=detalle: messagebox.showerror(
-                    "Error al sacar foto",
-                    error or "El cliente terminó con error."
-                    )
-                )
-                
-
+            request_photo(camara_ip, camara_puerto)
         except Exception as error:
-            raiz.after(
-                0,
-                lambda detalle=str(error): messagebox.showerror(
-                    "Error al sacar foto",
-                    detalle
-                )
-            )
-
+            raiz.after(0, lambda detalle=str(error): messagebox.showerror(
+                "Error al sacar foto", detalle))
         finally:
             raiz.after(0, restaurar_boton_foto)
 
     threading.Thread(target=ejecutar, daemon=True).start()
-
 
 def restaurar_boton_foto():
     estado = (
@@ -76,11 +49,9 @@ def cambiar_modo():
         elegidor.config(state="disabled")
         botonFoto.config(state="normal")
 
-ruta_foto = (
-    r"c:/Users/tiago/OneDrive/Documentos/UTEC/PIC II/"
-    r"PIC-2_Sistema_clasificacion_pallets/Programacion/Camara/"
-    r"camara_detectoraDePallets/foto_capturada.jpg"
-)
+ruta_foto = RUTA_FOTO
+camara_ip = None
+camara_puerto = 5000
 
 def actualizar_foto():
     try:
@@ -143,6 +114,42 @@ def conectar_wifi():
     )
     hilo.start()
 
+def buscar_camara():
+    botonBuscar.config(state="disabled", text="Buscando...")
+    estadoConexion.config(text="Buscando la cámara en la red...", fg="blue")
+
+    def tarea():
+        try:
+            camaras = descubrir_camaras()
+            raiz.after(0, lambda: mostrar_camaras(camaras))
+        except Exception as error:
+            raiz.after(0, lambda detalle=str(error): error_busqueda(detalle))
+
+    threading.Thread(target=tarea, daemon=True).start()
+
+
+def mostrar_camaras(camaras):
+    global camara_ip, camara_puerto
+    botonBuscar.config(state="normal", text="Buscar cámara")
+
+    if not camaras:
+        camara_ip = None
+        ipAsignadaLabel.config(text="(no se encontró ninguna cámara)", fg="red")
+        estadoConexion.config(text="Cámara no encontrada", fg="red")
+        return
+
+    ip, mac, puerto = camaras[0]   # si hay varias, por ahora la primera
+    camara_ip, camara_puerto = ip, puerto
+    ipAsignadaLabel.config(text=f"{ip}  ({mac})", fg="green")
+    estadoConexion.config(text="Cámara encontrada", fg="green")
+    botonBuscar.config(state="disabled", text="Cámara encontrada")
+    
+
+
+def error_busqueda(detalle):
+    botonBuscar.config(state="normal", text="Buscar cámara")
+    estadoConexion.config(text="Error al buscar la cámara", fg="red")
+    messagebox.showerror("Error de búsqueda", detalle)
 
 def ejecutar_provisionamiento(ssid, password):
     entorno = os.environ.copy()
@@ -216,6 +223,7 @@ def finalizar_exito():
     )
     botonConectar.config(state="normal", text="Conectar")
 
+    raiz.after(3000, buscar_camara)   # la cámara tarda unos segundos en tener IP
 
     messagebox.showinfo(
         "Conexión exitosa",
@@ -277,6 +285,10 @@ botonConectar = Button(
 )
 botonConectar.grid(row=3, column=1, padx=5, pady=10)
 
+botonBuscar = Button(conexion_frame, text="Buscar cámara", bg="#444444",
+                     fg="white", width=15, command=buscar_camara)
+botonBuscar.grid(row=3, column=0, padx=5, pady=10)
+
 estadoConexion = Label(
     conexion_frame,
     text="Esperando conexión",
@@ -297,16 +309,7 @@ elegidor = ttk.Combobox(conexion_pallet, values=["Pallet 1", "Pallet 2", "Pallet
 elegidor.grid(row=0, column=1, padx=5, pady=5)
 elegidor.set("Selecciona tipo de Pallet") 
 
-botonFoto = Button(
-    conexion_pallet,
-    text="Sacar foto",
-    bg="blue",
-    fg="white",
-    width=15,
-    command=sacar_foto,
-    state="disabled"
-)
-botonFoto.grid(row=1, column=1, padx=5, pady=5)
+
 
 # Modos de Opercion
 modo_operacion = Frame(raiz, bg="white", bd=5, relief="groove")
@@ -323,6 +326,17 @@ radio_automatico.grid(row=0, column=1, padx=20, pady=5, sticky="w")
 
 radio_manual = Radiobutton(modo_operacion, text="Manual", variable=opcion_seleccionada, value=2, bg="white", command=cambiar_modo)
 radio_manual.grid(row=0, column=2, padx=20, pady=5, sticky="w")
+
+botonFoto = Button(
+    conexion_pallet,
+    text="Sacar foto",
+    bg="blue",
+    fg="white",
+    width=15,
+    command=sacar_foto,
+    state="disabled"
+)
+botonFoto.grid(row=0, column=3, padx=5, pady=5)
 
 # Frame para mostrar el resultado y el estado de la operacion
 modo_resultado = Frame(raiz, bg="white", bd=5, relief="groove")
@@ -358,10 +372,14 @@ cambiar_modo()
 camara_frame = Frame(raiz, bg="black", bd=5, relief="solid")
 camara_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
+try:
+    with Image.open(ruta_foto) as imagen_pil:
+        imagen_pil.load()
+        imagen_redimensionada = imagen_pil.resize((560, 260))
+except (FileNotFoundError, OSError):
+    # Todavía no hay ninguna foto: se muestra un recuadro negro de relleno
+    imagen_redimensionada = Image.new("RGB", (560, 260), "black")
 
-
-imagen_pil = Image.open(ruta_foto)
-imagen_redimensionada = imagen_pil.resize((560, 260))
 miImagen = ImageTk.PhotoImage(imagen_redimensionada)
 
 etiqueta_foto = Label(camara_frame, image=miImagen, bg="black")

@@ -42,6 +42,9 @@
 #define CAM_PIN_HREF    23
 #define CAM_PIN_PCLK    22
 
+#define DISCOVERY_PORT     5001
+#define DISCOVERY_REQUEST  "DISCOVER_PALLET_CAM"
+
 #define LISTEN_PORT 5000
 
 #define EXAMPLE_PROV_SEC2_USERNAME "CamaraPallets"
@@ -53,6 +56,7 @@ static const int WIFI_CONNECTED_EVENT = BIT0;
 static EventGroupHandle_t wifi_event_group;
 
 static esp_err_t init_camera(void);
+static void udp_discovery_task(void *pvParameters);
 static void tcp_server_task(void *pvParameters);
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data);
@@ -131,6 +135,63 @@ static esp_err_t init_camera(void)
     return err;
 }
 
+static void udp_discovery_task(void *pvParameters)
+{
+    char rx_buffer[64];
+ 
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(DISCOVERY_PORT);
+ 
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "No se pudo crear el socket UDP de descubrimiento");
+        vTaskDelete(NULL);
+        return;
+    }
+ 
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "Error en el bind del socket UDP");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+ 
+    /* La respuesta es siempre la misma: se arma una sola vez.
+       Se usa la misma MAC (STA) con la que se arma el nombre PROV_xxxxxx. */
+    uint8_t mac[6];
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, mac));
+ 
+    char reply[64];
+    snprintf(reply, sizeof(reply), "PALLET_CAM;%02X:%02X:%02X:%02X:%02X:%02X;%d",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], LISTEN_PORT);
+ 
+    ESP_LOGI(TAG, "Descubrimiento UDP escuchando en el puerto %d", DISCOVERY_PORT);
+ 
+    while (1) {
+        struct sockaddr_in source_addr = {0};
+        socklen_t source_len = sizeof(source_addr);
+ 
+        /* Bloquea hasta que llega un datagrama; guarda en source_addr quien lo mando */
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                           (struct sockaddr *)&source_addr, &source_len);
+ 
+        if (len < 0) {
+            ESP_LOGE(TAG, "Error en recvfrom: %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(100));   /* evita un bucle de errores a toda velocidad */
+            continue;
+        }
+ 
+        rx_buffer[len] = '\0';
+ 
+        if (strcmp(rx_buffer, DISCOVERY_REQUEST) == 0) {
+            sendto(sock, reply, strlen(reply), 0,
+                   (struct sockaddr *)&source_addr, sizeof(source_addr));
+            ESP_LOGI(TAG, "Respondido pedido de descubrimiento");
+        }
+    }
+}
 
 static void tcp_server_task(void *pvParameters)
 {
@@ -433,6 +494,8 @@ esp_err_t custom_prov_data_handler(uint32_t session_id,
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "=== Firmware con descubrimiento UDP ===");
+
     esp_err_t ret = nvs_flash_init();
 
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -549,7 +612,10 @@ void app_main(void)
         portMAX_DELAY
     );
 
-    ESP_LOGI(TAG, "Wi-Fi conectado. Inicializando cámara...");
+    ESP_LOGI(TAG, "Wi-Fi conectado. Lanzando descubrimiento UDP...");
+
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    xTaskCreate(udp_discovery_task, "udp_discovery", 4096, NULL, 5, NULL);
 
     if (init_camera() != ESP_OK) {
         ESP_LOGE(TAG, "Error al inicializar la cámara");
