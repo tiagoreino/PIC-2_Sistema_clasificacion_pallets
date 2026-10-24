@@ -7,6 +7,7 @@ import subprocess
 import threading
 from cliente_foto import request_photo, RUTA_FOTO
 from descubrimiento_camara import descubrir_camaras
+
 def sacar_foto():
     if opcion_seleccionada.get() != 2:
         return
@@ -82,37 +83,58 @@ IDF_PATH = r"C:\esp\v6.1\esp-idf"
 
 
 def conectar_wifi():
-    ssid = cuadroWifi.get().strip()
+    modo = modoWifi.get()
+    valor_wifi = cuadroWifi.get().strip()
     password = cuadroContraseña.get()
 
-    if not ssid:
-        messagebox.showwarning(
-            "Falta la red",
-            "Ingresá el nombre de la red Wi-Fi."
+    if not valor_wifi:
+        mensaje = (
+            "Ingresá tu usuario institucional."
+            if modo == "UTEC"
+            else "Ingresá el nombre de tu red Wi-Fi (SSID)."
         )
+        messagebox.showwarning("Falta un dato", mensaje)
         return
 
     if not password:
         messagebox.showwarning(
             "Falta la contraseña",
-            "Ingresá la contraseña del Wi-Fi."
+            "Ingresá la contraseña correspondiente a la red."
+        )
+        return
+
+    if modo == "Casa" and len(password) < 8:
+        messagebox.showwarning(
+            "Contraseña inválida",
+            "Para WPA2-Personal, la contraseña debe tener "
+            "al menos 8 caracteres."
         )
         return
 
     botonConectar.config(state="disabled", text="Conectando...")
     estadoConexion.config(
-        text="Buscando la ESP32-CAM por Bluetooth...",
+        text="Enviando configuración por Bluetooth BLE...",
         fg="blue"
     )
 
-    # El proceso se ejecuta en segundo plano para no
-    # congelar la ventana de Tkinter.
-    hilo = threading.Thread(
+    threading.Thread(
         target=ejecutar_provisionamiento,
-        args=(ssid, password),
+        args=(modo, valor_wifi, password),
         daemon=True
-    )
-    hilo.start()
+    ).start()
+
+def actualizar_campos_wifi(event=None):
+    modo = modoWifi.get()
+
+    # Limpiar los campos al cambiar de red para evitar
+    # enviar accidentalmente el usuario como si fuera un SSID.
+    cuadroWifi.delete(0, END)
+    cuadroContraseña.delete(0, END)
+
+    if modo == "UTEC":
+        wifiLabel.config(text="Usuario institucional:")
+    else:
+        wifiLabel.config(text="Nombre de red (SSID):")
 
 def buscar_camara():
     botonBuscar.config(state="disabled", text="Buscando...")
@@ -151,9 +173,14 @@ def error_busqueda(detalle):
     estadoConexion.config(text="Error al buscar la cámara", fg="red")
     messagebox.showerror("Error de búsqueda", detalle)
 
-def ejecutar_provisionamiento(ssid, password):
+def ejecutar_provisionamiento(modo, valor_wifi, password):
     entorno = os.environ.copy()
     entorno["IDF_PATH"] = IDF_PATH
+
+    if modo == "UTEC":
+        credenciales = f"UTEC\n{valor_wifi}\n{password}"
+    else:
+        credenciales = f"CASA\n{valor_wifi}\n{password}"
 
     comando = [
         PYTHON_IDF,
@@ -163,8 +190,7 @@ def ejecutar_provisionamiento(ssid, password):
         "--sec_ver", "2",
         "--sec2_username", "CamaraPallets",
         "--sec2_pwd", "utec2026",
-        "--ssid", ssid,
-        "--passphrase", password
+        "--custom_data", credenciales
     ]
 
     try:
@@ -180,14 +206,18 @@ def ejecutar_provisionamiento(ssid, password):
         )
 
         salida = resultado.stdout + "\n" + resultado.stderr
+
         print("CÓDIGO DE SALIDA:", resultado.returncode)
         print("SALIDA DEL SCRIPT:")
         print(salida)
 
-        if (
+        exito = (
             resultado.returncode == 0
-            and "Provisioning was successful" in salida
-        ):
+            and "CustomData response:" in salida
+            and "SUCCESS" in salida
+        )
+
+        if exito:
             raiz.after(0, finalizar_exito)
         else:
             detalle = salida[-2500:] or (
@@ -203,9 +233,7 @@ def ejecutar_provisionamiento(ssid, password):
         raiz.after(
             0,
             lambda: finalizar_error(
-                "Se agotó el tiempo de espera. "
-                "Comprobá que la ESP32 esté anunciándose "
-                "por BLE y que Bluetooth esté activado."
+                "Se agotó el tiempo de espera del provisionamiento BLE."
             )
         )
 
@@ -218,17 +246,17 @@ def ejecutar_provisionamiento(ssid, password):
 
 def finalizar_exito():
     estadoConexion.config(
-        text="¡Wi-Fi configurado correctamente!",
-        fg="green"
+        text="Credenciales enviadas; verificando conexión...",
+        fg="blue"
     )
     botonConectar.config(state="normal", text="Conectar")
 
     raiz.after(3000, buscar_camara)   # la cámara tarda unos segundos en tener IP
 
     messagebox.showinfo(
-        "Conexión exitosa",
-        "La ESP32-CAM recibió las credenciales y "
-        "se conectó a la red Wi-Fi."
+        "Configuración enviada",
+        "La ESP32-CAM recibió los datos por BLE. "
+        "Ahora se comprobará la conexión Wi-Fi y se buscará la cámara."
     )
 
 
@@ -247,6 +275,7 @@ def finalizar_error(detalle):
 
 # 1. Ventana Principal
 raiz = Tk()
+modoWifi = StringVar(value="UTEC")
 raiz.title("|| Sistema de Clasificación de Pallets ||")
 raiz.iconbitmap(r"c:/Users/tiago/OneDrive/Documentos/UTEC/PIC II/PIC-2_Sistema_clasificacion_pallets/utecLogo.ico")
 raiz.geometry("600x700") 
@@ -263,17 +292,42 @@ tituloIpLabel.grid(row=0, column=0, padx=5, pady=5, sticky="w")
 ipAsignadaLabel = Label(conexion_frame, text="(Ejemplo de IP: 192.168.1.100)", bg="white", fg="gray")
 ipAsignadaLabel.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
-wifiLabel = Label(conexion_frame, text="Ingresa Wifi:", bg="white")
-wifiLabel.grid(row=1, column=0, padx=5, pady=5, sticky="w")
+modoWifiLabel = Label(
+    conexion_frame,
+    text="Red Wi-Fi:",
+    bg="white"
+)
+modoWifiLabel.grid(row=1, column=0, padx=5, pady=5, sticky="w")
+
+comboModoWifi = ttk.Combobox(
+    conexion_frame,
+    textvariable=modoWifi,
+    values=["UTEC", "Casa"],
+    state="readonly",
+    width=27
+)
+comboModoWifi.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+comboModoWifi.bind("<<ComboboxSelected>>", actualizar_campos_wifi)
+
+wifiLabel = Label(
+    conexion_frame,
+    text="Usuario institucional:",
+    bg="white"
+)
+wifiLabel.grid(row=2, column=0, padx=5, pady=5, sticky="w")
 
 cuadroWifi = Entry(conexion_frame, width=30)
-cuadroWifi.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+cuadroWifi.grid(row=2, column=1, padx=5, pady=5, sticky="w")
 
-contraseñaLabel = Label(conexion_frame, text="Ingresa Contraseña:", bg="white")
-contraseñaLabel.grid(row=2, column=0, padx=5, pady=5, sticky="w")
+contraseñaLabel = Label(
+    conexion_frame,
+    text="Contraseña:",
+    bg="white"
+)
+contraseñaLabel.grid(row=3, column=0, padx=5, pady=5, sticky="w")
 
 cuadroContraseña = Entry(conexion_frame, show="*", width=30)
-cuadroContraseña.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+cuadroContraseña.grid(row=3, column=1, padx=5, pady=5, sticky="w")
 
 botonConectar = Button(
     conexion_frame,
@@ -283,11 +337,17 @@ botonConectar = Button(
     width=15,
     command=conectar_wifi
 )
-botonConectar.grid(row=3, column=1, padx=5, pady=10)
+botonConectar.grid(row=4, column=1, padx=5, pady=10)
 
-botonBuscar = Button(conexion_frame, text="Buscar cámara", bg="#444444",
-                     fg="white", width=15, command=buscar_camara)
-botonBuscar.grid(row=3, column=0, padx=5, pady=10)
+botonBuscar = Button(
+    conexion_frame,
+    text="Buscar cámara",
+    bg="#444444",
+    fg="white",
+    width=15,
+    command=buscar_camara
+)
+botonBuscar.grid(row=4, column=0, padx=5, pady=10)
 
 estadoConexion = Label(
     conexion_frame,
@@ -295,7 +355,9 @@ estadoConexion = Label(
     bg="white",
     fg="gray"
 )
-estadoConexion.grid(row=4, column=0, columnspan=2, padx=5, pady=5)
+estadoConexion.grid(
+    row=5, column=0, columnspan=2, padx=5, pady=5
+)
 # 3. Frame para seleccion de pallets
 conexion_pallet = Frame(raiz, bg="white", bd=5, relief="groove")
 conexion_pallet.pack(fill="x", side="top", padx=10, pady=5)

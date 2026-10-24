@@ -25,6 +25,10 @@
 #include <lwip/sockets.h>
 #include <lwip/inet.h>
 
+#include "esp_eap_client.h"
+#include "esp_check.h"
+#include "driver/gpio.h"
+
 #define CAM_PIN_PWDN    32
 #define CAM_PIN_RESET   -1
 #define CAM_PIN_XCLK     0
@@ -49,6 +53,52 @@
 
 #define EXAMPLE_PROV_SEC2_USERNAME "CamaraPallets"
 #define EXAMPLE_PROV_SEC2_PWD      "utec2026"
+
+#define WIFI_ENTERPRISE_CREDENTIALS_EVENT BIT1
+#define UTEC_SSID "UTEC-2.4Ghz"
+
+#define LED_R GPIO_NUM_13
+#define LED_G GPIO_NUM_14
+#define LED_B GPIO_NUM_15
+
+static void led_rgb_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << LED_R) |
+                        (1ULL << LED_G) |
+                        (1ULL << LED_B),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+
+    gpio_set_level(LED_R, 0);
+    gpio_set_level(LED_G, 0);
+    gpio_set_level(LED_B, 0);
+}
+
+static void led_rgb(bool r, bool g, bool b)
+{
+    gpio_set_level(LED_R, r);
+    gpio_set_level(LED_G, g);
+    gpio_set_level(LED_B, b);
+}
+
+typedef enum {
+    WIFI_MODE_CASA,
+    WIFI_MODE_UTEC
+} wifi_profile_t;
+
+static wifi_profile_t wifi_profile = WIFI_MODE_UTEC;
+
+static char wifi_ssid[33];
+static char wifi_password[128];
+static char eap_identity[128];
+
+static void enterprise_connect_task(void *pvParameters);
 
 static const char *TAG = "app";
 
@@ -167,6 +217,8 @@ static void udp_discovery_task(void *pvParameters)
     snprintf(reply, sizeof(reply), "PALLET_CAM;%02X:%02X:%02X:%02X:%02X:%02X;%d",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], LISTEN_PORT);
  
+
+
     ESP_LOGI(TAG, "Descubrimiento UDP escuchando en el puerto %d", DISCOVERY_PORT);
  
     while (1) {
@@ -184,17 +236,34 @@ static void udp_discovery_task(void *pvParameters)
         }
  
         rx_buffer[len] = '\0';
- 
+
+        char ip_origen[INET_ADDRSTRLEN];
+        inet_ntoa_r(source_addr.sin_addr, ip_origen, sizeof(ip_origen));
+
+        ESP_LOGI(TAG, "UDP recibido desde %s:%d, bytes=%d, mensaje='%s'",
+                ip_origen, ntohs(source_addr.sin_port), len, rx_buffer);
+
         if (strcmp(rx_buffer, DISCOVERY_REQUEST) == 0) {
-            sendto(sock, reply, strlen(reply), 0,
-                   (struct sockaddr *)&source_addr, sizeof(source_addr));
-            ESP_LOGI(TAG, "Respondido pedido de descubrimiento");
+            int enviados = sendto(sock, reply, strlen(reply), 0,
+                                (struct sockaddr *)&source_addr,
+                                sizeof(source_addr));
+
+            if (enviados < 0) {
+                ESP_LOGE(TAG, "Error enviando respuesta UDP: errno=%d", errno);
+            } else {
+                ESP_LOGI(TAG, "Respuesta UDP enviada a %s:%d: %s",
+                        ip_origen, ntohs(source_addr.sin_port), reply);
+            }
+        } else {
+            ESP_LOGW(TAG, "Mensaje de descubrimiento no reconocido");
         }
     }
 }
 
 static void tcp_server_task(void *pvParameters)
 {
+    ESP_LOGI(TAG, "Entré en tcp_server_task()");
+
     char rx_buffer[128];
 
     struct sockaddr_in server_addr = {0};
@@ -397,15 +466,34 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         }
     } else if (event_base == WIFI_EVENT) {
         switch (event_id) {
-        case WIFI_EVENT_STA_START:
-            esp_wifi_connect();
-            break;
+        case WIFI_EVENT_STA_START: {
+            ESP_LOGI(TAG, "Evento STA_START recibido; intentando conectar");
 
-        case WIFI_EVENT_STA_DISCONNECTED:
-            ESP_LOGI(TAG, "Disconnected. Connecting to the AP again...");
-            esp_wifi_connect();
-            break;
+            esp_err_t err = esp_wifi_connect();
 
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Error en esp_wifi_connect(): %s",
+                        esp_err_to_name(err));
+            }
+            break;
+        }
+
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            led_rgb(true, false, false);  // Rojo: desconectado
+
+            wifi_event_sta_disconnected_t *event =
+                (wifi_event_sta_disconnected_t *)event_data;
+
+            ESP_LOGW(TAG, "Wi-Fi desconectado. Motivo: %d",
+                    event->reason);
+
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Error al reintentar: %s",
+                        esp_err_to_name(err));
+            }
+            break;
+        }
         default:
             break;
         }
@@ -415,6 +503,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 
         ESP_LOGI(TAG, "Connected with IP Address: " IPSTR,
                  IP2STR(&event->ip_info.ip));
+
+        led_rgb(false, true, false);  // Verde: Wi-Fi conectado
 
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_EVENT);
     } else if (event_base == PROTOCOMM_TRANSPORT_BLE_EVENT) {
@@ -467,33 +557,253 @@ static void get_device_service_name(char *service_name, size_t max)
              ssid_prefix, eth_mac[3], eth_mac[4], eth_mac[5]);
 }
 
-esp_err_t custom_prov_data_handler(uint32_t session_id,
-                                   const uint8_t *inbuf,
-                                   ssize_t inlen,
-                                   uint8_t **outbuf,
-                                   ssize_t *outlen,
-                                   void *priv_data)
+esp_err_t custom_prov_data_handler(
+    uint32_t session_id,
+    const uint8_t *inbuf,
+    ssize_t inlen,
+    uint8_t **outbuf,
+    ssize_t *outlen,
+    void *priv_data)
 {
-    if (inbuf != NULL) {
-        ESP_LOGI(TAG, "Received data: %.*s", (int)inlen, (char *)inbuf);
+    char datos[320];
+
+    if (inbuf == NULL || inlen <= 0 ||
+        inlen >= (ssize_t)sizeof(datos)) {
+        return ESP_ERR_INVALID_ARG;
     }
 
-    char response[] = "SUCCESS";
+    memcpy(datos, inbuf, inlen);
+    datos[inlen] = '\0';
 
-    *outbuf = (uint8_t *)strdup(response);
+    // Quitar terminadores finales, si el cliente los incluyó.
+    size_t longitud = strlen(datos);
+    while (longitud > 0 &&
+           (datos[longitud - 1] == '\r' ||
+            datos[longitud - 1] == '\0')) {
+        datos[--longitud] = '\0';
+    }
 
-    if (*outbuf == NULL) {
-        ESP_LOGE(TAG, "System out of memory");
+    char *modo = datos;
+    char *sep1 = strchr(modo, '\n');
+
+    if (sep1 == NULL) {
+        ESP_LOGE(TAG, "Falta el primer separador BLE");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *sep1 = '\0';
+    char *valor_wifi = sep1 + 1;
+
+    char *sep2 = strchr(valor_wifi, '\n');
+
+    if (sep2 == NULL) {
+        ESP_LOGE(TAG, "Falta el segundo separador BLE");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *sep2 = '\0';
+    char *password = sep2 + 1;
+
+    // Quitar CR de cada campo si se recibió CRLF.
+    char *campos[] = { modo, valor_wifi, password };
+
+    for (size_t i = 0; i < 3; i++) {
+        size_t n = strlen(campos[i]);
+        if (n > 0 && campos[i][n - 1] == '\r') {
+            campos[i][n - 1] = '\0';
+        }
+    }
+
+    if (valor_wifi[0] == '\0' || password[0] == '\0') {
+        ESP_LOGE(TAG, "SSID/usuario o contraseña vacíos");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(modo, "UTEC") == 0) {
+        if (strlen(valor_wifi) >= sizeof(eap_identity) ||
+            strlen(password) >= sizeof(wifi_password)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        wifi_profile = WIFI_MODE_UTEC;
+
+        strncpy(wifi_ssid, UTEC_SSID, sizeof(wifi_ssid) - 1);
+        wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
+
+        strcpy(eap_identity, valor_wifi);
+        strcpy(wifi_password, password);
+
+        ESP_LOGI(TAG, "Configuración recibida: UTEC Enterprise PEAP");
+
+        led_rgb(true, true, false);  // Amarillo: credenciales recibidas
+
+    } else if (strcmp(modo, "CASA") == 0) {
+        if (strlen(valor_wifi) > 32 ||
+            strlen(password) >= 63) {
+            ESP_LOGE(TAG, "SSID o contraseña demasiado largos");
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        wifi_profile = WIFI_MODE_CASA;
+
+        strcpy(wifi_ssid, valor_wifi);
+        strcpy(wifi_password, password);
+        eap_identity[0] = '\0';
+
+        ESP_LOGI(TAG, "Configuración recibida: Casa WPA2-Personal");
+    } else {
+        ESP_LOGE(TAG, "Modo Wi-Fi desconocido");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char *response = strdup("SUCCESS");
+
+    if (response == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
+    *outbuf = (uint8_t *)response;
     *outlen = strlen(response) + 1;
+
+    xEventGroupSetBits(
+        wifi_event_group,
+        WIFI_ENTERPRISE_CREDENTIALS_EVENT
+    );
 
     return ESP_OK;
 }
 
+static void enterprise_connect_task(void *pvParameters)
+{
+    xEventGroupWaitBits(
+        wifi_event_group,
+        WIFI_ENTERPRISE_CREDENTIALS_EVENT,
+        pdTRUE,
+        pdFALSE,
+        portMAX_DELAY
+    );
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ESP_LOGI(TAG, "Preparando conexión Wi-Fi");
+
+    ESP_ERROR_CHECK(network_prov_mgr_deinit());
+
+    wifi_config_t wifi_config = {0};
+
+    memcpy(
+        wifi_config.sta.ssid,
+        wifi_ssid,
+        strlen(wifi_ssid)
+    );
+
+    if (wifi_profile == WIFI_MODE_CASA) {
+        // Wi-Fi doméstico: WPA2-Personal.
+        strncpy(
+            (char *)wifi_config.sta.password,
+            wifi_password,
+            sizeof(wifi_config.sta.password) - 1
+        );
+
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+        ESP_LOGI(TAG, "Autenticación WPA2-Personal");
+    } else {
+        // Wi-Fi institucional: WPA2-Enterprise PEAP.
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_ENTERPRISE;
+
+        ESP_ERROR_CHECK(
+            esp_eap_client_set_eap_methods(ESP_EAP_TYPE_PEAP)
+        );
+
+        ESP_ERROR_CHECK(
+            esp_eap_client_set_identity(
+                (const unsigned char *)eap_identity,
+                strlen(eap_identity)
+            )
+        );
+
+        ESP_ERROR_CHECK(
+            esp_eap_client_set_username(
+                (const unsigned char *)eap_identity,
+                strlen(eap_identity)
+            )
+        );
+
+        ESP_ERROR_CHECK(
+            esp_eap_client_set_password(
+                (const unsigned char *)wifi_password,
+                strlen(wifi_password)
+            )
+        );
+
+        ESP_ERROR_CHECK(esp_wifi_sta_enterprise_enable());
+
+        ESP_LOGI(TAG, "Autenticación WPA2-Enterprise PEAP");
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    ESP_ERROR_CHECK(
+        esp_wifi_set_config(WIFI_IF_STA, &wifi_config)
+    );
+
+    ESP_LOGI(TAG, "SSID configurado: %s", wifi_ssid);
+    ESP_LOGI(TAG, "Iniciando Wi-Fi");
+
+    esp_err_t err = esp_wifi_start();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error al iniciar Wi-Fi: %s",
+                 esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true
+    };
+
+    uint16_t ap_count = 0;
+
+    ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, true));
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
+
+    wifi_ap_record_t *aps = calloc(ap_count, sizeof(wifi_ap_record_t));
+
+    if (aps != NULL && ap_count > 0) {
+        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, aps));
+
+        for (int i = 0; i < ap_count; i++) {
+            ESP_LOGI(TAG, "Red encontrada: %s | RSSI: %d dBm",
+                    (char *)aps[i].ssid, aps[i].rssi);
+        }
+
+        free(aps);
+    }
+
+    // Se mantiene la llamada explícita que ya utilizabas.
+    err = esp_wifi_connect();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error al solicitar conexión: %s",
+                 esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Solicitud de conexión enviada");
+    }
+
+    vTaskDelete(NULL);
+}
+
 void app_main(void)
 {
+
+    led_rgb_init();
+    led_rgb(true, true, true);  // Blanco: arrancando
+
     ESP_LOGI(TAG, "=== Firmware con descubrimiento UDP ===");
 
     esp_err_t ret = nvs_flash_init();
@@ -516,95 +826,104 @@ void app_main(void)
         return;
     }
 
-    ESP_ERROR_CHECK(esp_event_handler_register(
-        NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(
-        PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID,
-        &event_handler, NULL));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(
-        PROTOCOMM_SECURITY_SESSION_EVENT, ESP_EVENT_ANY_ID,
-        &event_handler, NULL));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
-
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    network_prov_mgr_config_t config = {
+    // Registrar los eventos ANTES de iniciar Wi-Fi.
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            WIFI_EVENT,
+            ESP_EVENT_ANY_ID,
+            &event_handler,
+            NULL
+        )
+    );
+
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            IP_EVENT,
+            IP_EVENT_STA_GOT_IP,
+            &event_handler,
+            NULL
+        )
+    );
+
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    // El Wi-Fi queda inicializado, pero todavía no se inicia.
+    // Primero recibimos las credenciales por BLE.
+    network_prov_mgr_config_t prov_config = {
         .scheme = network_prov_scheme_ble,
         .scheme_event_handler =
             NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM
     };
 
-    ESP_ERROR_CHECK(network_prov_mgr_init(config));
-
-    bool provisioned = false;
+    ESP_ERROR_CHECK(network_prov_mgr_init(prov_config));
 
     ESP_ERROR_CHECK(
-        network_prov_mgr_is_wifi_provisioned(&provisioned));
+        network_prov_mgr_endpoint_create("custom-data")
+    );
 
-    if (!provisioned) {
-        ESP_LOGI(TAG, "Starting provisioning");
+    // Crear el servicio BLE y la sesión de seguridad.
+    char service_name[12];
+    get_device_service_name(service_name, sizeof(service_name));
 
-        char service_name[12];
-        get_device_service_name(service_name, sizeof(service_name));
+    network_prov_security2_params_t sec2_params = {0};
+    sec2_params.salt = sec2_salt;
+    sec2_params.salt_len = sizeof(sec2_salt);
+    sec2_params.verifier = sec2_verifier;
+    sec2_params.verifier_len = sizeof(sec2_verifier);
 
-        network_prov_security2_params_t sec2_params = {0};
+    const char *service_key = NULL;
 
-        sec2_params.salt = sec2_salt;
-        sec2_params.salt_len = sizeof(sec2_salt);
-        sec2_params.verifier = sec2_verifier;
-        sec2_params.verifier_len = sizeof(sec2_verifier);
+    uint8_t custom_service_uuid[] = {
+        0xb4, 0xdf, 0x5a, 0x1c,
+        0x3f, 0x6b, 0xf4, 0xbf,
+        0xea, 0x4a, 0x82, 0x03,
+        0x04, 0x90, 0x1a, 0x02
+    };
 
-        const char *service_key = NULL;
+    network_prov_scheme_ble_set_service_uuid(custom_service_uuid);
 
-        uint8_t custom_service_uuid[] = {
-            0xb4, 0xdf, 0x5a, 0x1c,
-            0x3f, 0x6b, 0xf4, 0xbf,
-            0xea, 0x4a, 0x82, 0x03,
-            0x04, 0x90, 0x1a, 0x02
-        };
+    led_rgb(true, false, true);  // Violeta: esperando credenciales BLE
 
-        network_prov_scheme_ble_set_service_uuid(custom_service_uuid);
-
-        ESP_ERROR_CHECK(
-            network_prov_mgr_endpoint_create("custom-data"));
-
-        ESP_LOGI(TAG, "Salt inicial: %02x %02x %02x %02x",
-            (unsigned char)sec2_salt[0],
-            (unsigned char)sec2_salt[1],
-            (unsigned char)sec2_salt[2],
-            (unsigned char)sec2_salt[3]);
-
-        ESP_LOGI(TAG, "Salt len: %u, verifier len: %u",
-            (unsigned int)sec2_params.salt_len,
-            (unsigned int)sec2_params.verifier_len);
-
-        ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(
+    ESP_ERROR_CHECK(
+        network_prov_mgr_start_provisioning(
             NETWORK_PROV_SECURITY_2,
             (const void *)&sec2_params,
             service_name,
-            service_key));
+            service_key
+        )
+    );
 
-        ESP_ERROR_CHECK(network_prov_mgr_endpoint_register(
-            "custom-data", custom_prov_data_handler, NULL));
-    } else {
-        ESP_LOGI(TAG, "Already provisioned, starting Wi-Fi STA");
+    // Registrar el handler después de iniciar el servicio.
+    ESP_ERROR_CHECK(
+        network_prov_mgr_endpoint_register(
+            "custom-data",
+            custom_prov_data_handler,
+            NULL
+        )
+    );
 
-        ESP_ERROR_CHECK(network_prov_mgr_deinit());
+    // La tarea espera hasta recibir las credenciales.
+    BaseType_t resultado = xTaskCreate(
+        enterprise_connect_task,
+        "enterprise_connect",
+        4096,
+        NULL,
+        5,
+        NULL
+    );
 
-        ESP_ERROR_CHECK(esp_event_handler_register(
-            WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
-
-        wifi_init_sta();
+    if (resultado != pdPASS) {
+        ESP_LOGE(TAG, "No se pudo crear la tarea Enterprise");
+        return;
     }
 
-    xEventGroupWaitBits(
+    // Esperar hasta obtener una IP, aunque el aprovisionamiento BLE demore.
+    EventBits_t bits = xEventGroupWaitBits(
         wifi_event_group,
         WIFI_CONNECTED_EVENT,
         pdTRUE,
@@ -612,19 +931,40 @@ void app_main(void)
         portMAX_DELAY
     );
 
-    ESP_LOGI(TAG, "Wi-Fi conectado. Lanzando descubrimiento UDP...");
-
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    xTaskCreate(udp_discovery_task, "udp_discovery", 4096, NULL, 5, NULL);
-
-    if (init_camera() != ESP_OK) {
-        ESP_LOGE(TAG, "Error al inicializar la cámara");
+    if (!(bits & WIFI_CONNECTED_EVENT)) {
+        ESP_LOGE(TAG, "No se obtuvo el evento de conexión Wi-Fi");
         return;
     }
 
-    ESP_LOGI(TAG, "Cámara inicializada correctamente");
+    ESP_LOGI(TAG, "Wi-Fi conectado. Iniciando servicios de cámara.");
 
-    BaseType_t resultado = xTaskCreate(
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    xTaskCreate(
+        udp_discovery_task,
+        "udp_discovery",
+        4096,
+        NULL,
+        5,
+        NULL
+    );
+
+    if (init_camera() != ESP_OK) {
+        ESP_LOGE(TAG, "Error al inicializar la cámara");
+
+        while (1) {
+            led_rgb(true, false, false);
+            vTaskDelay(pdMS_TO_TICKS(300));
+
+            led_rgb(false, false, false);
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+    }
+
+    ESP_LOGI(TAG, "Cámara inicializada correctamente");
+    led_rgb(false, false, true);  // Azul: cámara inicializada
+
+    resultado = xTaskCreate(
         tcp_server_task,
         "tcp_server",
         8192,
@@ -634,10 +974,13 @@ void app_main(void)
     );
 
     if (resultado != pdPASS) {
-        ESP_LOGE(TAG, "No se pudo crear la tarea del servidor TCP");
+        ESP_LOGE(TAG, "No se pudo crear el servidor TCP");
+        led_rgb(true, false, false);
         return;
     }
 
+    led_rgb(false, true, false);  // Verde: sistema listo
+
     ESP_LOGI(TAG, "Servidor de cámara iniciado en el puerto %d",
-             LISTEN_PORT);
-}
+            LISTEN_PORT);
+} 

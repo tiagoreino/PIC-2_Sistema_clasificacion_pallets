@@ -7,7 +7,8 @@ idf_component_register(
         esp_netif
         nvs_flash
         network_provisioning
-        esp_camera
+        esp32-camera
         bt
         protocomm
+        wpa_supplicant
 )
