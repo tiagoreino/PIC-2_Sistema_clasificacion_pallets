@@ -5,13 +5,63 @@ from PIL import Image, ImageTk
 import os
 import subprocess
 import threading
-from cliente_foto import request_photo, RUTA_FOTO
+from cliente_foto import (request_photo, set_state, RUTA_FOTO, RUTA_FOTO_ANALIZADA,
+                          ESTADO_NADA, ESTADO_ACEPTADO, ESTADO_RECHAZADO, ESTADO_MANUAL)
+from identificacion import evaluar_pallet, PALLET_A_COLOR
 from descubrimiento_camara import descubrir_camaras
 
-def sacar_foto():
-    if opcion_seleccionada.get() != 2:
-        return
+camara_ip = None
+camara_puerto = 5000
+ruta_mostrada = RUTA_FOTO     # cual archivo se ve en la interfaz
+conformes = 0
+no_conformes = 0
 
+
+def estado_para_modo():
+    # Manual -> 11 | Automatico (en espera) -> 00
+    return ESTADO_MANUAL if opcion_seleccionada.get() == 2 else ESTADO_NADA
+
+
+def enviar_estado(estado):
+    #Manda el codigo de 2 bits a la camara, en un hilo aparte.
+    if camara_ip is None:
+        return
+    ip, puerto = camara_ip, camara_puerto
+
+    def tarea():
+        try:
+            set_state(ip, estado, puerto)
+        except Exception as error:
+            raiz.after(0, lambda d=str(error): estadoConexion.config(
+                text=f"No se pudo enviar el estado: {d}"[:90], fg="red"))
+
+    threading.Thread(target=tarea, daemon=True).start()
+
+
+def mostrar_foto_cruda():
+    global ruta_mostrada
+    ruta_mostrada = RUTA_FOTO
+
+
+def mostrar_resultado(aceptado):
+    global ruta_mostrada, conformes, no_conformes
+    ruta_mostrada = RUTA_FOTO_ANALIZADA   # la foto con el recuadro rojo
+
+    if aceptado:
+        conformes += 1
+        modoEstado.config(text="Aceptado", fg="green")
+        modoConformes.config(text=f"Conformes: {conformes}")
+    else:
+        no_conformes += 1
+        modoEstado.config(text="Rechazado", fg="red")
+        modoNoConformes.config(text=f"No Conformes: {no_conformes}")
+
+    # Si mientras analizaba el operador paso a manual, no se pisa el 11
+    if opcion_seleccionada.get() == 1:
+        enviar_estado(ESTADO_ACEPTADO if aceptado else ESTADO_RECHAZADO)
+
+
+def sacar_foto():
     if camara_ip is None:
         messagebox.showwarning(
             "Sin cámara",
@@ -19,11 +69,25 @@ def sacar_foto():
         )
         return
 
+    modo = opcion_seleccionada.get()
+    tipo = elegidor.get()
+
+    if modo == 1 and tipo not in PALLET_A_COLOR:
+        messagebox.showwarning("Falta el tipo", "Elegí el tipo de pallet a clasificar.")
+        return
+
+    ip, puerto = camara_ip, camara_puerto
     botonFoto.config(state="disabled", text="Tomando foto...")
 
     def ejecutar():
         try:
-            request_photo(camara_ip, camara_puerto)
+            request_photo(ip, puerto)
+
+            if modo == 1:   # Automatico: analizar y mandar 01 / 10
+                aceptado, _resultado = evaluar_pallet(RUTA_FOTO, RUTA_FOTO_ANALIZADA, tipo)
+                raiz.after(0, lambda: mostrar_resultado(aceptado))
+            else:           # Manual: foto cruda, sin recuadro
+                raiz.after(0, mostrar_foto_cruda)
         except Exception as error:
             raiz.after(0, lambda detalle=str(error): messagebox.showerror(
                 "Error al sacar foto", detalle))
@@ -32,31 +96,26 @@ def sacar_foto():
 
     threading.Thread(target=ejecutar, daemon=True).start()
 
+
 def restaurar_boton_foto():
-    estado = (
-        "normal"
-        if opcion_seleccionada.get() == 2
-        else "disabled"
-    )
-    botonFoto.config(state=estado, text="Sacar foto")
+    texto = "Analizar pallet" if opcion_seleccionada.get() == 1 else "Sacar foto"
+    botonFoto.config(state="normal", text=texto)
 
 
-# Función para habilitar o deshabilitar botones segun el modo
+# Habilita/deshabilita controles segun el modo y avisa a la camara (00 o 11)
 def cambiar_modo():
     if opcion_seleccionada.get() == 1:  # Automático
         elegidor.config(state="readonly")
-        botonFoto.config(state="disabled")
-    else:  # Manual
+        botonFoto.config(state="normal", text="Analizar pallet")
+    else:                               # Manual
         elegidor.config(state="disabled")
-        botonFoto.config(state="normal")
+        botonFoto.config(state="normal", text="Sacar foto")
+    enviar_estado(estado_para_modo())
 
-ruta_foto = RUTA_FOTO
-camara_ip = None
-camara_puerto = 5000
 
 def actualizar_foto():
     try:
-        with Image.open(ruta_foto) as imagen:
+        with Image.open(ruta_mostrada) as imagen:
             imagen.load()
             imagen_redimensionada = imagen.resize((560, 260))
 
@@ -68,7 +127,7 @@ def actualizar_foto():
         pass
 
     raiz.after(300, actualizar_foto)
-
+    
 # Rutas del cliente de provisionamiento
 PYTHON_IDF = (
     r"C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe"
@@ -165,6 +224,7 @@ def mostrar_camaras(camaras):
     ipAsignadaLabel.config(text=f"{ip}  ({mac})", fg="green")
     estadoConexion.config(text="Cámara encontrada", fg="green")
     botonBuscar.config(state="disabled", text="Cámara encontrada")
+    enviar_estado(estado_para_modo()) 
     
 
 
@@ -367,7 +427,7 @@ conexion_pallet.pack(fill="x", side="top", padx=10, pady=5)
 palletLabel = Label(conexion_pallet, text="Clasificación:", bg="white", font=("Arial", 10, "bold"))
 palletLabel.grid(row=0, column=0, padx=5, pady=5, sticky="w")
 
-elegidor = ttk.Combobox(conexion_pallet, values=["Pallet 1", "Pallet 2", "Pallet 3"], state="readonly", width=25)
+elegidor = ttk.Combobox(conexion_pallet, values=["Rojo", "Azul"], state="readonly", width=25)
 elegidor.grid(row=0, column=1, padx=5, pady=5)
 elegidor.set("Selecciona tipo de Pallet") 
 
@@ -435,7 +495,7 @@ camara_frame = Frame(raiz, bg="black", bd=5, relief="solid")
 camara_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
 try:
-    with Image.open(ruta_foto) as imagen_pil:
+    with Image.open(ruta_mostrada) as imagen_pil:
         imagen_pil.load()
         imagen_redimensionada = imagen_pil.resize((560, 260))
 except (FileNotFoundError, OSError):

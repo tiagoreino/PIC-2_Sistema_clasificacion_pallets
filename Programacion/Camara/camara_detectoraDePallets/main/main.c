@@ -18,6 +18,7 @@
 #include <esp_netif.h>
 #include <nvs_flash.h>
 #include <esp_camera.h>
+#include <esp_timer.h>
 
 #include <network_provisioning/manager.h>
 #include <network_provisioning/scheme_ble.h>
@@ -28,6 +29,7 @@
 #include "esp_eap_client.h"
 #include "esp_check.h"
 #include "driver/gpio.h"
+
 
 #define CAM_PIN_PWDN    32
 #define CAM_PIN_RESET   -1
@@ -101,6 +103,65 @@ static char eap_identity[128];
 static void enterprise_connect_task(void *pvParameters);
 
 static const char *TAG = "app";
+
+#define PIN_ESTADO_H  GPIO_NUM_12   // bit alto
+#define PIN_ESTADO_L  GPIO_NUM_2    // bit bajo
+
+#define ESTADO_NADA       0
+#define ESTADO_ACEPTADO   1
+#define ESTADO_RECHAZADO  2
+#define ESTADO_MANUAL     3
+
+#define RESULTADO_HOLD_MS 2000      // duración del 01/10; 0 = queda fijo hasta el próximo cambio
+
+static esp_timer_handle_t timer_resultado = NULL;
+
+static void estado_pines_escribir(uint8_t codigo)
+{
+    uint8_t h = (codigo >> 1) & 1;
+    uint8_t l = codigo & 1;
+
+    if (!h) gpio_set_level(PIN_ESTADO_H, 0);
+    if (!l) gpio_set_level(PIN_ESTADO_L, 0);
+    if (h)  gpio_set_level(PIN_ESTADO_H, 1);
+    if (l)  gpio_set_level(PIN_ESTADO_L, 1);
+}
+
+static void timer_resultado_cb(void *arg)
+{
+    estado_pines_escribir(ESTADO_NADA);
+    ESP_LOGI(TAG, "Fin del pulso de resultado: estado 00");
+}
+
+static void estado_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << PIN_ESTADO_H) | (1ULL << PIN_ESTADO_L),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+    estado_pines_escribir(ESTADO_NADA);
+
+    const esp_timer_create_args_t args = {
+        .callback = timer_resultado_cb,
+        .name = "resultado"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&args, &timer_resultado));
+}
+
+static void estado_set(uint8_t codigo)
+{
+    esp_timer_stop(timer_resultado);   // si no estaba corriendo devuelve error; se ignora
+    estado_pines_escribir(codigo);
+
+    if (RESULTADO_HOLD_MS > 0 &&
+        (codigo == ESTADO_ACEPTADO || codigo == ESTADO_RECHAZADO)) {
+        esp_timer_start_once(timer_resultado, (uint64_t)RESULTADO_HOLD_MS * 1000ULL);
+    }
+}
 
 static const int WIFI_CONNECTED_EVENT = BIT0;
 static EventGroupHandle_t wifi_event_group;
@@ -329,6 +390,9 @@ static void tcp_server_task(void *pvParameters)
         }
 
         rx_buffer[len] = '\0';
+        while (len > 0 && (rx_buffer[len - 1] == '\r' || rx_buffer[len - 1] == '\n')) {
+            rx_buffer[--len] = '\0';
+        }
         ESP_LOGI(TAG, "Comando recibido: %s", rx_buffer);
 
         if (strcmp(rx_buffer, "TAKE_PHOTO") == 0) {
@@ -402,6 +466,17 @@ static void tcp_server_task(void *pvParameters)
 
                 esp_camera_fb_return(fb);
             }
+         } else if (strncmp(rx_buffer, "SET_STATE:", 10) == 0) {
+            const char *resp = "ERROR";
+
+            if (len == 11 && rx_buffer[10] >= '0' && rx_buffer[10] <= '3') {
+                uint8_t codigo = (uint8_t)(rx_buffer[10] - '0');
+                estado_set(codigo);
+                ESP_LOGI(TAG, "Estado de pines: %d%d",
+                         (codigo >> 1) & 1, codigo & 1);
+                resp = "OK";
+            }
+            send(sock, resp, strlen(resp), 0);
         } else {
             ESP_LOGW(TAG, "Comando desconocido: %s", rx_buffer);
         }
@@ -803,6 +878,8 @@ void app_main(void)
 
     led_rgb_init();
     led_rgb(true, true, true);  // Blanco: arrancando
+
+    estado_init();  
 
     ESP_LOGI(TAG, "=== Firmware con descubrimiento UDP ===");
 
