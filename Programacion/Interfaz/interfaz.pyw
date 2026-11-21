@@ -5,6 +5,7 @@ from PIL import Image, ImageTk
 import os
 import subprocess
 import threading
+import socket
 from cliente_foto import (request_photo, set_state, RUTA_FOTO, RUTA_FOTO_ANALIZADA,
                           ESTADO_NADA, ESTADO_ACEPTADO, ESTADO_RECHAZADO, ESTADO_MANUAL)
 from identificacion import evaluar_pallet, PALLET_A_COLOR
@@ -101,6 +102,27 @@ def restaurar_boton_foto():
     texto = "Analizar pallet" if opcion_seleccionada.get() == 1 else "Sacar foto"
     botonFoto.config(state="normal", text=texto)
 
+PUERTO_TRIGGER = 5002
+
+
+def escuchar_trigger():
+    # La cámara avisa por UDP cuando el Arduino pide una foto
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("", PUERTO_TRIGGER))
+    while True:
+        datos, _origen = sock.recvfrom(64)
+        if datos.strip() == b"PALLET_TRIGGER":
+            raiz.after(0, sacar_foto_por_trigger)
+
+
+def sacar_foto_por_trigger():
+    if camara_ip is None or str(botonFoto.cget("state")) == "disabled":
+        return   # sin cámara o ya hay una foto en curso
+    if opcion_seleccionada.get() == 1 and elegidor.get() not in PALLET_A_COLOR:
+        estadoConexion.config(
+            text="El Arduino pidió foto pero falta elegir el tipo de pallet", fg="red")
+        return
+    sacar_foto()
 
 # Habilita/deshabilita controles segun el modo y avisa a la camara (00 o 11)
 def cambiar_modo():
@@ -139,6 +161,30 @@ SCRIPT_PROV = (
 )
 
 IDF_PATH = r"C:\esp\v6.1\esp-idf"
+
+# Busca por BLE el nombre PROV_xxxxxx de la cámara (cambia con la MAC de cada placa)
+SCRIPT_BUSCAR_BLE = (
+    "import asyncio\n"
+    "from bleak import BleakScanner\n"
+    "async def main():\n"
+    "    for d in await BleakScanner.discover(timeout=6):\n"
+    "        if d.name and d.name.startswith('PROV_'):\n"
+    "            print(d.name)\n"
+    "asyncio.run(main())\n"
+)
+
+
+def buscar_nombre_ble():
+    resultado = subprocess.run(
+        [PYTHON_IDF, "-c", SCRIPT_BUSCAR_BLE],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    nombres = [l.strip() for l in resultado.stdout.splitlines() if l.strip()]
+    print("Cámaras BLE encontradas:", nombres)
+    return nombres[0] if nombres else None
 
 
 def conectar_wifi():
@@ -242,11 +288,28 @@ def ejecutar_provisionamiento(modo, valor_wifi, password):
     else:
         credenciales = f"CASA\n{valor_wifi}\n{password}"
 
+    try:
+        nombre_ble = buscar_nombre_ble()
+    except Exception as error:
+        nombre_ble = None
+        print("Error al escanear BLE:", error)
+
+    if nombre_ble is None:
+        raiz.after(
+            0,
+            lambda: finalizar_error(
+                "No se encontró ninguna cámara por Bluetooth (PROV_...).\n"
+                "Verificá que el LED esté violeta y que el Bluetooth "
+                "de la PC esté prendido."
+            )
+        )
+        return
+
     comando = [
         PYTHON_IDF,
         SCRIPT_PROV,
         "--transport", "ble",
-        "--service_name", "PROV_720044",
+        "--service_name", nombre_ble,
         "--sec_ver", "2",
         "--sec2_username", "CamaraPallets",
         "--sec2_pwd", "utec2026",
@@ -509,4 +572,5 @@ etiqueta_foto.image = miImagen
 etiqueta_foto.pack(expand=True)
 
 actualizar_foto()
+threading.Thread(target=escuchar_trigger, daemon=True).start()
 raiz.mainloop()

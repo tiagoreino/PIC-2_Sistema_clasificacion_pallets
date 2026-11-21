@@ -114,6 +114,15 @@ static const char *TAG = "app";
 
 #define RESULTADO_HOLD_MS 2000      // duración del 01/10; 0 = queda fijo hasta el próximo cambio
 
+#define PIN_TRIGGER        GPIO_NUM_3    // U0R: 1 lógico del Arduino = sacar foto
+#define PIN_FLASH          GPIO_NUM_4
+#define TRIGGER_PORT       5002
+#define TRIGGER_MSG        "PALLET_TRIGGER"
+#define TRIGGER_REINTENTOS 3
+
+static volatile uint32_t pc_ip = 0;              // IP de la PC (orden de red), 0 = todavía no se conoce
+static volatile bool trigger_pendiente = false;  // se avisó a la PC y se espera el TAKE_PHOTO
+
 static esp_timer_handle_t timer_resultado = NULL;
 
 static void estado_pines_escribir(uint8_t codigo)
@@ -160,6 +169,80 @@ static void estado_set(uint8_t codigo)
     if (RESULTADO_HOLD_MS > 0 &&
         (codigo == ESTADO_ACEPTADO || codigo == ESTADO_RECHAZADO)) {
         esp_timer_start_once(timer_resultado, (uint64_t)RESULTADO_HOLD_MS * 1000ULL);
+    }
+}
+
+static void trigger_flash_init(void)
+{
+    // Flash: entrada con pull-down para que no se prenda por ruido
+    gpio_reset_pin(PIN_FLASH);
+    gpio_set_direction(PIN_FLASH, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PIN_FLASH, GPIO_PULLDOWN_ONLY);
+
+    // GPIO3 deja de ser RX de la UART (el log por U0T sigue andando)
+    gpio_reset_pin(PIN_TRIGGER);
+    gpio_set_direction(PIN_TRIGGER, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PIN_TRIGGER, GPIO_PULLDOWN_ONLY);
+}
+
+static void trigger_task(void *pvParameters)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+
+    if (sock < 0) {
+        ESP_LOGE(TAG, "No se pudo crear el socket UDP del trigger");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int cuenta_alto = 0;
+    bool anterior = false;
+
+    ESP_LOGI(TAG, "Esperando trigger del Arduino en GPIO%d", PIN_TRIGGER);
+
+    while (1) {
+        if (gpio_get_level(PIN_TRIGGER)) {
+            if (cuenta_alto < 3) cuenta_alto++;
+        } else {
+            cuenta_alto = 0;
+        }
+
+        // 30 ms seguidos en alto = señal válida (filtra ruido)
+        bool alto = (cuenta_alto >= 3);
+
+        if (alto && !anterior) {
+            if (pc_ip == 0) {
+                ESP_LOGW(TAG, "Trigger recibido pero todavía no se conoce la IP de la PC");
+            } else if (trigger_pendiente) {
+                ESP_LOGW(TAG, "Trigger ignorado: ya hay una foto pendiente");
+            } else {
+                trigger_pendiente = true;
+
+                struct sockaddr_in dest = {0};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(TRIGGER_PORT);
+                dest.sin_addr.s_addr = pc_ip;
+
+                // Se repite el aviso hasta que la PC pida la foto
+                for (int i = 0; i < TRIGGER_REINTENTOS && trigger_pendiente; i++) {
+                    sendto(sock, TRIGGER_MSG, strlen(TRIGGER_MSG), 0,
+                           (struct sockaddr *)&dest, sizeof(dest));
+                    ESP_LOGI(TAG, "Trigger enviado a la PC (intento %d)", i + 1);
+
+                    for (int t = 0; t < 20 && trigger_pendiente; t++) {
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                }
+
+                if (trigger_pendiente) {
+                    ESP_LOGE(TAG, "La PC no pidió la foto después del trigger");
+                    trigger_pendiente = false;
+                }
+            }
+        }
+
+        anterior = alto;
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -297,6 +380,7 @@ static void udp_discovery_task(void *pvParameters)
         }
  
         rx_buffer[len] = '\0';
+        pc_ip = source_addr.sin_addr.s_addr;
 
         char ip_origen[INET_ADDRSTRLEN];
         inet_ntoa_r(source_addr.sin_addr, ip_origen, sizeof(ip_origen));
@@ -379,6 +463,7 @@ static void tcp_server_task(void *pvParameters)
                   ip_cliente, sizeof(ip_cliente));
 
         ESP_LOGI(TAG, "Conexión TCP aceptada desde %s", ip_cliente);
+        pc_ip = source_addr.sin_addr.s_addr;
 
         int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
         ESP_LOGI(TAG, "recv del comando devolvió %d bytes", len);
@@ -396,6 +481,7 @@ static void tcp_server_task(void *pvParameters)
         ESP_LOGI(TAG, "Comando recibido: %s", rx_buffer);
 
         if (strcmp(rx_buffer, "TAKE_PHOTO") == 0) {
+            trigger_pendiente = false;
             camera_fb_t *fb_anterior = esp_camera_fb_get();
 
         if (fb_anterior != NULL) {
@@ -880,6 +966,7 @@ void app_main(void)
     led_rgb(true, true, true);  // Blanco: arrancando
 
     estado_init();  
+    trigger_flash_init();
 
     ESP_LOGI(TAG, "=== Firmware con descubrimiento UDP ===");
 
@@ -1056,8 +1143,10 @@ void app_main(void)
         return;
     }
 
+    xTaskCreate(trigger_task, "trigger", 4096, NULL, 5, NULL);
+
     led_rgb(false, true, false);  // Verde: sistema listo
 
     ESP_LOGI(TAG, "Servidor de cámara iniciado en el puerto %d",
             LISTEN_PORT);
-} 
+}
