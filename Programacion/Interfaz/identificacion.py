@@ -1,5 +1,5 @@
 import os
-from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
+from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageFont
 
 UMBRAL_PIXELES = 10     # minimo de pixeles para considerar que hay objeto (ignora ruido)
 MARGEN_FORMA = 15       # diferencia ancho/alto para distinguir cuadrado/circulo de rectangulo
@@ -10,6 +10,34 @@ PALLET_A_COLOR = {
     "Azul": "AZUL",
 }
 
+# Calibracion px -> mm (regla de 3): un objeto de REF_MM mide REF_PX en la foto
+# Calibracion px -> mm (regla de 3) separada para cada eje
+REF_MM_X = 100.0   # ancho real del objeto de referencia (mm)
+REF_PX_X = 200.0   # ancho que mide en la foto (px)
+REF_MM_Y = 100.0   # alto real (mm)
+REF_PX_Y = 200.0   # alto en la foto (px)
+
+# Dimensiones esperadas (ancho, alto) en mm de cada tipo de pallet y tolerancia
+PALLET_A_DIMENSIONES = {
+    "Rojo": (50.0, 40.0),
+    "Azul": (50.0, 40.0),
+}
+TOLERANCIA_MM = 5.0
+
+
+def _px_a_mm(px, eje="x"):
+    if eje == "x":
+        return px * REF_MM_X / REF_PX_X
+    return px * REF_MM_Y / REF_PX_Y 
+
+
+def _cumple_dimensiones(ancho_mm, alto_mm, dimensiones):
+    if dimensiones is None:
+        return True
+    esp_ancho, esp_alto = dimensiones
+    return (abs(ancho_mm - esp_ancho) <= TOLERANCIA_MM and
+            abs(alto_mm - esp_alto) <= TOLERANCIA_MM)
+
 
 def _cumple_color(r, g, b, color):
     if color == "ROJO":
@@ -19,7 +47,7 @@ def _cumple_color(r, g, b, color):
     return False
 
 
-def procesar_y_detectar(ruta_imagen, ruta_salida, color_buscado="NEGRO"):
+def procesar_y_detectar(ruta_imagen, ruta_salida, color_buscado="NEGRO", dimensiones=None):
     """
     Filtra la imagen, busca el color pedido y guarda en ruta_salida la imagen
     filtrada (con recuadro rojo si encontro el objeto).
@@ -62,6 +90,9 @@ def procesar_y_detectar(ruta_imagen, ruta_salida, color_buscado="NEGRO"):
         "ancho_objeto": 0,
         "alto_objeto": 0,
         "forma": None,
+        "ancho_mm": 0.0,
+        "alto_mm": 0.0,
+        "cumple_dimensiones": False,
         "ruta_imagen": ruta_salida,
     }
 
@@ -78,9 +109,36 @@ def procesar_y_detectar(ruta_imagen, ruta_salida, color_buscado="NEGRO"):
             else "Rectángulo"
         )
 
+        ancho_mm = _px_a_mm(ancho_obj + 1, "x")
+        alto_mm = _px_a_mm(alto_obj + 1, "y")
+        cumple = _cumple_dimensiones(ancho_mm, alto_mm, dimensiones)
+        resultado["ancho_mm"] = round(ancho_mm, 1)
+        resultado["alto_mm"] = round(alto_mm, 1)
+        resultado["cumple_dimensiones"] = cumple
+
+        # Verde si cumple las dimensiones, rojo si no
+        color_recuadro = (0, 255, 0) if cumple else (255, 0, 0)
+
+        # Grosor y letra proporcionales a la foto (QVGA de la camara o fotos grandes)
+        grosor = max(3, min(ancho, alto) // 100)
+        tam_letra = max(14, min(ancho, alto) // 15)
+
         dibujo = ImageDraw.Draw(img_salida)
         dibujo.rectangle([(x_min, y_min), (x_max, y_max)],
-                         outline=(0, 255, 0), width=3)
+                         outline=color_recuadro, width=grosor)
+
+        # Medidas arriba del recuadro (o adentro si no entra arriba)
+        texto = f"{ancho_mm:.0f} x {alto_mm:.0f} mm"
+        try:
+            fuente = ImageFont.load_default(size=tam_letra)
+        except TypeError:
+            fuente = ImageFont.load_default()
+        caja = dibujo.textbbox((0, 0), texto, font=fuente)
+        alto_texto = caja[3] - caja[1] + 4
+        y_texto = y_min - alto_texto - 2 if y_min - alto_texto - 2 >= 0 else y_min + 4
+        dibujo.rectangle([(x_min, y_texto), (x_min + caja[2] - caja[0] + 6, y_texto + alto_texto)],
+                         fill=color_recuadro)
+        dibujo.text((x_min + 3, y_texto + 1), texto, fill=(0, 0, 0), font=fuente)
 
     # Escritura atomica, porque la interfaz lee este archivo cada 300 ms
     ruta_tmp = ruta_salida + ".tmp"
@@ -91,15 +149,35 @@ def procesar_y_detectar(ruta_imagen, ruta_salida, color_buscado="NEGRO"):
 
 
 def criterio_aceptacion(resultado):
-    # ASUMIDO: el pallet es conforme si se detecto el color que corresponde a su tipo.
-    return resultado["detectado"]
+    # El objeto es un pallet valido si tiene un color conocido y las medidas de ese color
+    return resultado["detectado"] and resultado["cumple_dimensiones"]
 
 
 def evaluar_pallet(ruta_foto, ruta_salida, tipo_pallet):
-    # Devuelve (aceptado: bool, resultado: dict). Lo llama la interfaz.
-    color = PALLET_A_COLOR[tipo_pallet]
-    resultado = procesar_y_detectar(ruta_foto, ruta_salida, color)
-    return criterio_aceptacion(resultado), resultado
+    # Devuelve (aceptado, resultado). Lo llama la interfaz.
+    # aceptado: True = es el tipo elegido, False = es otro tipo de pallet valido,
+    # None = objeto extrano (ningun color conocido o no cumple las medidas de su color)
+    mejor = None
+    rutas = []
+
+    # Se prueban todos los colores: el que tiene mas pixeles dice que objeto es
+    for tipo, color in PALLET_A_COLOR.items():
+        ruta_color = os.path.splitext(ruta_salida)[0] + f"_{color}.jpg"
+        r = procesar_y_detectar(ruta_foto, ruta_color, color, PALLET_A_DIMENSIONES.get(tipo))
+        r["tipo"] = tipo
+        rutas.append(ruta_color)
+        if mejor is None or r["pixeles"] > mejor["pixeles"]:
+            mejor = r
+
+    os.replace(mejor["ruta_imagen"], ruta_salida)
+    for ruta in rutas:
+        if os.path.exists(ruta):
+            os.remove(ruta)
+    mejor["ruta_imagen"] = ruta_salida
+
+    if not criterio_aceptacion(mejor):
+        return None, mejor
+    return mejor["tipo"] == tipo_pallet, mejor
 
 
 if __name__ == "__main__":

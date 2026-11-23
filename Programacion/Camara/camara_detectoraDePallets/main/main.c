@@ -29,6 +29,7 @@
 #include "esp_eap_client.h"
 #include "esp_check.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 
 
 #define CAM_PIN_PWDN    32
@@ -116,6 +117,9 @@ static const char *TAG = "app";
 
 #define PIN_TRIGGER        GPIO_NUM_3    // U0R: 1 lógico del Arduino = sacar foto
 #define PIN_FLASH          GPIO_NUM_4
+#define FLASH_BRILLO       128     // 0-255 (PWM del flash, mas alto = mas corriente)
+#define FLASH_ESPERA_MS    150     // tiempo para que la camara se ajuste a la luz
+#define FLASH_DESCARTES    2       // fotos que se tiran antes de la buena
 #define TRIGGER_PORT       5002
 #define TRIGGER_MSG        "PALLET_TRIGGER"
 #define TRIGGER_REINTENTOS 3
@@ -172,12 +176,33 @@ static void estado_set(uint8_t codigo)
     }
 }
 
+static void flash_set(uint32_t brillo)
+{
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, brillo);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+}
+
 static void trigger_flash_init(void)
 {
-    // Flash: entrada con pull-down para que no se prenda por ruido
-    gpio_reset_pin(PIN_FLASH);
-    gpio_set_direction(PIN_FLASH, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(PIN_FLASH, GPIO_PULLDOWN_ONLY);
+    // Flash por PWM (canal y timer 1; la camara usa el 0 para XCLK), arranca apagado
+    ledc_timer_config_t timer_flash = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_1,
+        .freq_hz = 5000,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_flash));
+
+    ledc_channel_config_t canal_flash = {
+        .gpio_num = PIN_FLASH,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1,
+        .timer_sel = LEDC_TIMER_1,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&canal_flash));
 
     // GPIO3 deja de ser RX de la UART (el log por U0T sigue andando)
     gpio_reset_pin(PIN_TRIGGER);
@@ -482,13 +507,20 @@ static void tcp_server_task(void *pvParameters)
 
         if (strcmp(rx_buffer, "TAKE_PHOTO") == 0) {
             trigger_pendiente = false;
-            camera_fb_t *fb_anterior = esp_camera_fb_get();
 
-        if (fb_anterior != NULL) {
-            esp_camera_fb_return(fb_anterior);
-        }
+            // Flash prendido: se espera y se tiran fotos viejas para que la buena salga con luz
+            flash_set(FLASH_BRILLO);
+            vTaskDelay(pdMS_TO_TICKS(FLASH_ESPERA_MS));
 
-        camera_fb_t *fb = esp_camera_fb_get();
+            for (int i = 0; i < FLASH_DESCARTES; i++) {
+                camera_fb_t *fb_anterior = esp_camera_fb_get();
+                if (fb_anterior != NULL) {
+                    esp_camera_fb_return(fb_anterior);
+                }
+            }
+
+            camera_fb_t *fb = esp_camera_fb_get();
+            flash_set(0);
 
             if (fb == NULL) {
                 ESP_LOGE(TAG, "Fallo al capturar la foto");

@@ -48,6 +48,18 @@ def mostrar_resultado(aceptado):
     global ruta_mostrada, conformes, no_conformes
     ruta_mostrada = RUTA_FOTO_ANALIZADA   # la foto con el recuadro rojo
 
+    # Objeto extrano: se pasa a manual (11) y el Arduino hace parada de emergencia
+    if aceptado is None:
+        modoEstado.config(text="Objeto extraño", fg="orange")
+        opcion_seleccionada.set(2)
+        cambiar_modo()
+        messagebox.showwarning(
+            "Objeto extraño",
+            "Se detectó un objeto que no es un pallet válido.\n"
+            "Retiralo a mano, apretá PARAR en el tablero y volvé a Automático."
+        )
+        return
+
     if aceptado:
         conformes += 1
         modoEstado.config(text="Aceptado", fg="green")

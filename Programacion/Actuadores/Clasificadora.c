@@ -12,12 +12,17 @@
 #include <stdbool.h>
 
 // ---------------- Configuracion ----------------
-#define VEL_NORMAL        200       // PWM 0-255 de la cinta
-#define VEL_LENTA         110       // PWM despues del laser previo al stacker
+#define VEL_NORMAL        95        // PWM 0-255 de la cinta
+#define VEL_LENTA         85        // PWM despues del laser previo al stacker
+#define VEL_ARRANQUE      115       // PWM del empujon al arrancar desde parado
+#define ARRANQUE_MS       300UL     // duracion del empujon, despues queda la velocidad fija
 #define UMBRAL_LDR        600       // ADC 0-1023: por debajo = laser cortado (ajustar con la prueba)
 #define EMERGENCIA_NC     0         // 1 si el boton de emergencia es normalmente cerrado
 #ifndef DEBUG_UART
 #define DEBUG_UART        1         // 1 = muestra los cambios de estado por el monitor serie (9600)
+#endif
+#ifndef BUZZER_PASIVO
+#define BUZZER_PASIVO     0         // 1 si el buzzer es pasivo (se le genera un tono de 500 Hz)
 #endif
 
 #define ANTIRREBOTE_MS    40UL
@@ -38,10 +43,10 @@
 #define RELE_PISTON     PB0     // D8, activo en bajo
 #define FIN_PISTON      PD3     // D3, activo en bajo
 
-// L293 (cinta)
-#define CINTA_EN        PB3     // D11 (OC2A, PWM)
-#define CINTA_1A        PB5     // D13
-#define CINTA_2A        PD6     // D6
+// Puente H (cinta)
+#define CINTA_EN        PB3     // D11 (OC2A, PWM) -> ENA
+#define CINTA_IN1       PB5     // D13 -> IN1
+#define CINTA_IN2       PD6     // D6  -> IN2
 
 // Laseres con LDR (entradas analogicas)
 #define LASER_CAMARA    PC0     // A0 / ADC0
@@ -59,6 +64,9 @@
 
 // Pedido de foto a la ESP32
 #define FOTO            PC5     // A5 -> divisor -> GPIO3
+
+// Buzzer en D0 (RX libre: la UART solo usa TX), a traves de un transistor
+#define BUZZER          PD0
 
 #define COD_NADA        0
 #define COD_ACEPTADO    1
@@ -213,22 +221,48 @@ static uint8_t codigo_esp(void)
 // ---------------- Cinta ----------------
 typedef enum { CINTA_PARADA, CINTA_ADELANTE, CINTA_ATRAS } dir_cinta_t;
 
+static dir_cinta_t cinta_dir = CINTA_PARADA;
+static uint8_t cinta_vel_fija = 0;
+static bool cinta_arrancando = false;
+static uint32_t cinta_inicio = 0;
+
 static void cinta(dir_cinta_t dir, uint8_t velocidad)
 {
-    PORTB &= (uint8_t)~(1 << CINTA_1A);
-    PORTD &= (uint8_t)~(1 << CINTA_2A);
+    PORTB &= (uint8_t)~(1 << CINTA_IN1);
+    PORTD &= (uint8_t)~(1 << CINTA_IN2);
 
     if (dir == CINTA_PARADA || velocidad == 0) {
         TCCR2A &= (uint8_t)~(1 << COM2A1);
         PORTB &= (uint8_t)~(1 << CINTA_EN);
+        cinta_dir = CINTA_PARADA;
+        cinta_arrancando = false;
         return;
     }
 
-    if (dir == CINTA_ADELANTE) PORTB |= (1 << CINTA_1A);
-    else                       PORTD |= (1 << CINTA_2A);
+    if (dir == CINTA_ADELANTE) PORTB |= (1 << CINTA_IN1);
+    else                       PORTD |= (1 << CINTA_IN2);
 
-    OCR2A = velocidad;
+    cinta_vel_fija = velocidad;
+
+    // Si arranca desde parado o cambia de sentido: empujon y despues la velocidad fija
+    if (dir != cinta_dir && VEL_ARRANQUE > velocidad) {
+        OCR2A = VEL_ARRANQUE;
+        cinta_arrancando = true;
+        cinta_inicio = tiempo_ms();
+    } else if (!cinta_arrancando) {
+        OCR2A = velocidad;
+    }
+
+    cinta_dir = dir;
     TCCR2A |= (1 << COM2A1);
+}
+
+static void cinta_tick(uint32_t ahora)
+{
+    if (cinta_arrancando && (uint32_t)(ahora - cinta_inicio) >= ARRANQUE_MS) {
+        OCR2A = cinta_vel_fija;
+        cinta_arrancando = false;
+    }
 }
 
 // ---------------- Piston ----------------
@@ -281,6 +315,35 @@ static void foto_tick(uint32_t ahora)
     if (foto_activa && (uint32_t)(ahora - foto_inicio) >= PULSO_FOTO_MS) {
         PORTC &= (uint8_t)~(1 << FOTO);
         foto_activa = false;
+    }
+}
+
+// ---------------- Buzzer (pitidos no bloqueantes) ----------------
+static uint8_t buzz_pasos = 0;      // cada pitido = 2 pasos (sonando / silencio)
+static uint32_t buzz_inicio = 0;
+
+static void pitidos(uint8_t n, uint32_t ahora)
+{
+    buzz_pasos = n * 2;
+    buzz_inicio = ahora;
+}
+
+static void buzzer_tick(uint32_t ahora)
+{
+    if (buzz_pasos && (uint32_t)(ahora - buzz_inicio) >= 150UL) {
+        buzz_pasos--;
+        buzz_inicio = ahora;
+    }
+
+    // Pasos pares = sonando
+    if (buzz_pasos && !(buzz_pasos & 1)) {
+#if BUZZER_PASIVO
+        PORTD ^= (1 << BUZZER);
+#else
+        PORTD |= (1 << BUZZER);
+#endif
+    } else {
+        PORTD &= (uint8_t)~(1 << BUZZER);
     }
 }
 
@@ -352,8 +415,40 @@ static void cambiar(estado_t nuevo, uint32_t ahora)
 static void ir_a_error(uint32_t ahora)
 {
     todo_apagado();
+    pitidos(5, ahora);
     cambiar(ST_ERROR, ahora);
 }
+
+#if DEBUG_UART
+// Muestra lo que llega de la ESP32 y cada boton/laser que se activa
+static void debug_entradas(void)
+{
+    static const char *const nombres_e[N_ENTRADAS] = {
+        "ESP bajo", "ESP alto", "FIN PISTON",
+        "LASER CAMARA", "LASER PRE", "LASER STACKER",
+        "AVANZAR", "PARAR", "RETROCEDER", "SUBIR", "BAJAR", "FOTO",
+        "EMERGENCIA"
+    };
+    static uint8_t cod_anterior = 0xFF;
+    uint8_t cod = codigo_esp();
+
+    if (cod != cod_anterior) {
+        char txt[] = "ESP32 manda: 00\r\n";
+        txt[13] = '0' + ((cod >> 1) & 1);
+        txt[14] = '0' + (cod & 1);
+        uart_texto(txt);
+        cod_anterior = cod;
+    }
+
+    for (uint8_t i = E_FIN_PISTON; i < N_ENTRADAS; i++) {
+        if (FLANCO(i)) {
+            uart_texto("Activo: ");
+            uart_texto(nombres_e[i]);
+            uart_texto("\r\n");
+        }
+    }
+}
+#endif
 
 static void ejecutar_secuencia(uint32_t ahora)
 {
@@ -363,6 +458,15 @@ static void ejecutar_secuencia(uint32_t ahora)
     // La emergencia tiene prioridad sobre todo
     if (ACTIVA(E_EMERGENCIA) && estado != ST_EMERGENCIA) {
         todo_apagado();
+        pitidos(3, ahora);
+        cambiar(ST_EMERGENCIA, ahora);
+        return;
+    }
+
+    // Objeto extrano: la PC pasa a 11 mientras se espera el resultado -> emergencia
+    if (estado == ST_ESPERA_RESULTADO && cod == COD_MANUAL) {
+        todo_apagado();
+        pitidos(3, ahora);
         cambiar(ST_EMERGENCIA, ahora);
         return;
     }
@@ -408,9 +512,11 @@ static void ejecutar_secuencia(uint32_t ahora)
 
     case ST_ESPERA_RESULTADO:
         if (cod == COD_ACEPTADO) {
+            pitidos(1, ahora);
             cinta(CINTA_ADELANTE, VEL_NORMAL);
             cambiar(ST_ACEPTADO, ahora);
         } else if (cod == COD_RECHAZADO) {
+            pitidos(2, ahora);
             cinta(CINTA_ADELANTE, VEL_NORMAL);
             cambiar(ST_RECHAZADO_PRE, ahora);
         } else if (t >= RESULTADO_MS) {
@@ -509,13 +615,15 @@ static void configurar_pines(void)
     PORTB |= (1 << RELE_PISTON);
     DDRB |= (1 << RELE_PISTON);
 
-    // L293 y foto como salidas en bajo
-    PORTB &= (uint8_t)~((1 << CINTA_EN) | (1 << CINTA_1A));
-    DDRB |= (1 << CINTA_EN) | (1 << CINTA_1A);
-    PORTD &= (uint8_t)~(1 << CINTA_2A);
-    DDRD |= (1 << CINTA_2A);
+    // Puente H y foto como salidas en bajo
+    PORTB &= (uint8_t)~((1 << CINTA_EN) | (1 << CINTA_IN1));
+    DDRB |= (1 << CINTA_EN) | (1 << CINTA_IN1);
+    PORTD &= (uint8_t)~(1 << CINTA_IN2);
+    DDRD |= (1 << CINTA_IN2);
     PORTC &= (uint8_t)~(1 << FOTO);
     DDRC |= (1 << FOTO);
+    PORTD &= (uint8_t)~(1 << BUZZER);
+    DDRD |= (1 << BUZZER);
 
     // ESP32: entradas sin pull-up
     DDRD &= (uint8_t)~((1 << ESP_BAJO) | (1 << ESP_ALTO));
@@ -559,8 +667,13 @@ int main(void)
 
         adc_tick();
         entradas_actualizar(ahora);
+#if DEBUG_UART
+        debug_entradas();
+#endif
         piston_tick(ahora);
         ejecutar_secuencia(ahora);
+        cinta_tick(ahora);
         foto_tick(ahora);
+        buzzer_tick(ahora);
     }
 }

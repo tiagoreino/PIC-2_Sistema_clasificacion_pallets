@@ -1,6 +1,6 @@
-// Prueba de los 3 laseres con LDR - Arduino UNO (ATmega328P) en C
+// Prueba de los 3 láseres con LDR - Arduino UNO (ATmega328P) en C
 // Muestra por UART (9600) el valor del ADC de A0, A1 y A2 (0-1023) cada 250 ms.
-// El LED de la placa (D13) se prende si alguno esta por debajo del umbral.
+// El LED de la placa (D13) se prende si alguno está por debajo del umbral (láser cortado).
 
 #ifndef F_CPU
 #define F_CPU 16000000UL
@@ -10,7 +10,7 @@
 #include <util/delay.h>
 #include <stdint.h>
 
-#define UMBRAL_LDR      600     // por debajo = laser cortado (ajustar con esta prueba)
+#define UMBRAL_LDR      600     // por debajo = láser cortado (ajustar con esta prueba)
 #define LED             PB5     // D13
 
 static void uart_init(void)
@@ -44,9 +44,9 @@ static void uart_numero(uint16_t n)
 
 static void adc_init(void)
 {
-    ADMUX = (1 << REFS0);
-    ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
-    DIDR0 = (1 << ADC0D) | (1 << ADC1D) | (1 << ADC2D);
+    ADMUX = (1 << REFS0);                                   // referencia AVcc (5 V)
+    ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);  // prescaler 128
+    DIDR0 = (1 << ADC0D) | (1 << ADC1D) | (1 << ADC2D);     // sin buffer digital en A0-A2
 }
 
 static uint16_t adc_leer(uint8_t canal)
