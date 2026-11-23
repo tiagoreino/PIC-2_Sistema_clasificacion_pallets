@@ -12,10 +12,10 @@ PALLET_A_COLOR = {
 
 # Calibracion px -> mm (regla de 3): un objeto de REF_MM mide REF_PX en la foto
 # Calibracion px -> mm (regla de 3) separada para cada eje
-REF_MM_X = 100.0   # ancho real del objeto de referencia (mm)
-REF_PX_X = 200.0   # ancho que mide en la foto (px)
-REF_MM_Y = 100.0   # alto real (mm)
-REF_PX_Y = 200.0   # alto en la foto (px)
+REF_MM_X = 50.0
+REF_PX_X = 104.0
+REF_MM_Y = 40.0
+REF_PX_Y = 83.0   # alto en la foto (px)
 
 # Dimensiones esperadas (ancho, alto) en mm de cada tipo de pallet y tolerancia
 PALLET_A_DIMENSIONES = {
@@ -39,12 +39,79 @@ def _cumple_dimensiones(ancho_mm, alto_mm, dimensiones):
             abs(alto_mm - esp_alto) <= TOLERANCIA_MM)
 
 
+# Color por proporcion entre canales (no por valor absoluto): aguanta cambios de luz.
+# Ej: rojo = el canal R manda y G y B son menos de la mitad de R.
+BRILLO_MIN = 110         # canal principal minimo (descarta zonas oscuras o sombras)
+DIF_MIN = 60             # el canal principal le saca al menos esto al segundo (descarta grises)
+ROJO_MAX_G = 0.62        # G < 0.62 * R  (deja afuera el naranja)
+ROJO_MAX_B = 0.55        # B < 0.55 * R
+AZUL_MAX_R = 0.60        # R < 0.60 * B
+AZUL_MAX_G = 0.85        # G < 0.85 * B
+ROJO_BRILLO_MIN = 150    # el rojo pide mas brillo: el reflejo del laser en el fondo es rojo oscuro
+FRACCION_PERFIL = 0.5    # columna/fila cuenta como pallet si tiene al menos la mitad de la mas llena
+
+
 def _cumple_color(r, g, b, color):
     if color == "ROJO":
-        return r > 230 and g < 180 and b < 200
+        return (r >= max(BRILLO_MIN, ROJO_BRILLO_MIN) and r - max(g, b) >= DIF_MIN and
+                g < r * ROJO_MAX_G and b < r * ROJO_MAX_B)
     if color == "AZUL":
-        return b > 230 and g < 180 and r < 200
+        return (b >= BRILLO_MIN and b - r >= DIF_MIN and
+                r < b * AZUL_MAX_R and g < b * AZUL_MAX_G)
     return False
+
+
+def _mancha_mas_grande(mascara, ancho, alto):
+    mejor = (0, 0, 0, 0, 0)
+    mejor_pixeles = []
+    visto = bytearray(ancho * alto)
+
+    for inicio in range(ancho * alto):
+        if not mascara[inicio] or visto[inicio]:
+            continue
+
+        pila = [inicio]
+        visto[inicio] = 1
+        cant = 0
+        x0, y0, x1, y1 = ancho, alto, 0, 0
+        pixeles = []
+
+        while pila:
+            i = pila.pop()
+            y, x = divmod(i, ancho)
+            cant += 1
+            pixeles.append(i)
+            x0, x1 = min(x0, x), max(x1, x)
+            y0, y1 = min(y0, y), max(y1, y)
+
+            for j in (i - 1 if x > 0 else -1, i + 1 if x < ancho - 1 else -1,
+                      i - ancho, i + ancho):
+                if 0 <= j < ancho * alto and mascara[j] and not visto[j]:
+                    visto[j] = 1
+                    pila.append(j)
+
+        if cant > mejor[0]:
+            mejor = (cant, x0, y0, x1, y1)
+            mejor_pixeles = pixeles
+
+    if not mejor_pixeles:
+        return mejor
+
+    # Recorte por perfil: se descartan columnas y filas con pocos pixeles
+    # (brillo del laser, reflejos o bordes que se pegan al pallet)
+    cols = [0] * ancho
+    filas = [0] * alto
+    for i in mejor_pixeles:
+        y, x = divmod(i, ancho)
+        cols[x] += 1
+        filas[y] += 1
+
+    lim_c = max(cols) * FRACCION_PERFIL
+    lim_f = max(filas) * FRACCION_PERFIL
+    xs = [x for x in range(ancho) if cols[x] >= lim_c]
+    ys = [y for y in range(alto) if filas[y] >= lim_f]
+
+    return (mejor[0], xs[0], ys[0], xs[-1], ys[-1])
 
 
 def procesar_y_detectar(ruta_imagen, ruta_salida, color_buscado="NEGRO", dimensiones=None):
@@ -69,19 +136,16 @@ def procesar_y_detectar(ruta_imagen, ruta_salida, color_buscado="NEGRO", dimensi
 
     # Segmentacion por color
     pix = img_filtros.load()
-    x_min, y_min = ancho, alto
-    x_max, y_max = 0, 0
-    pixeles = 0
+    mascara = bytearray(ancho * alto)
 
     for x in range(ancho):
         for y in range(alto):
             r, g, b = pix[x, y]
             if _cumple_color(r, g, b, color_buscado):
-                pixeles += 1
-                x_min = min(x_min, x)
-                x_max = max(x_max, x)
-                y_min = min(y_min, y)
-                y_max = max(y_max, y)
+                mascara[y * ancho + x] = 1
+
+    # Se queda con la mancha mas grande del color (el pallet); lo demas es ruido o fondo
+    pixeles, x_min, y_min, x_max, y_max = _mancha_mas_grande(mascara, ancho, alto)
 
     resultado = {
         "detectado": pixeles > UMBRAL_PIXELES,

@@ -12,12 +12,12 @@
 #include <stdbool.h>
 
 // ---------------- Configuracion ----------------
-#define VEL_NORMAL        95        // PWM 0-255 de la cinta
-#define VEL_LENTA         85        // PWM despues del laser previo al stacker
+#define VEL_NORMAL        80        // PWM 0-255 de la cinta
 #define VEL_ARRANQUE      115       // PWM del empujon al arrancar desde parado
-#define ARRANQUE_MS       300UL     // duracion del empujon, despues queda la velocidad fija
-#define UMBRAL_LDR        600       // ADC 0-1023: por debajo = laser cortado (ajustar con la prueba)
+#define ARRANQUE_MS       100UL     // duracion del empujon, despues queda la velocidad fija
+#define UMBRAL_LDR        900       // ADC 0-1023: por debajo = laser cortado (ajustar con la prueba)
 #define EMERGENCIA_NC     0         // 1 si el boton de emergencia es normalmente cerrado
+#define FIN_PISTON_NC     0         // 1 = fin de carrera del piston cableado en NC a GND
 #ifndef DEBUG_UART
 #define DEBUG_UART        1         // 1 = muestra los cambios de estado por el monitor serie (9600)
 #endif
@@ -26,6 +26,8 @@
 #endif
 
 #define ANTIRREBOTE_MS    40UL
+#define ANTIRREBOTE_LDR_MS 5UL     // las LDR responden rapido: el pallet pasa en poco tiempo
+#define BLANQUEO_RELE_MS  300UL     // tras conmutar el rele se ignoran los botones (ruido)
 #define PULSO_FOTO_MS     100UL
 #define RESULTADO_MS      8000UL    // espera maxima del 01/10 de la ESP32
 #define REINTENTOS_FOTO   2
@@ -33,6 +35,9 @@
 #define PISTON_MIN_MS     3000UL    // igual que ESPERA_MS de PruebaPistonPIC
 #define PISTON_MAX_MS     10000UL   // si no llega el fin de carrera, error
 #define PISTON_BAJADA_MS  2000UL    // espera despues de apagar el rele
+#ifndef USAR_FIN_PISTON
+#define USAR_FIN_PISTON   1         // 0 = sin fin de carrera: el piston se apaga solo a los PISTON_MIN_MS
+#endif
 
 // ---------------- Pines ----------------
 // ESP32 (sin pull-up)
@@ -41,7 +46,7 @@
 
 // Piston (igual que PruebaPistonPIC)
 #define RELE_PISTON     PB0     // D8, activo en bajo
-#define FIN_PISTON      PD3     // D3, activo en bajo
+#define FIN_PISTON      PC2     // A2 (ver FIN_PISTON_NC)
 
 // Puente H (cinta)
 #define CINTA_EN        PB3     // D11 (OC2A, PWM) -> ENA
@@ -50,8 +55,7 @@
 
 // Laseres con LDR (entradas analogicas)
 #define LASER_CAMARA    PC0     // A0 / ADC0
-#define LASER_PRE       PC1     // A1 / ADC1, antes del stacker
-#define LASER_STACKER   PC2     // A2 / ADC2, debajo del stacker
+#define LASER_STACKER   PC1     // A1 / ADC1, debajo del stacker
 
 // Botones (a GND, pull-up interno)
 #define BTN_AVANZAR     PD4     // D4
@@ -109,14 +113,14 @@ static void configurar_temporizador(void)
 }
 
 // ---------------- ADC para las LDR ----------------
-static uint16_t adc_valor[3] = { 1023, 1023, 1023 };
+static uint16_t adc_valor[2] = { 1023, 1023 };
 static uint8_t adc_canal = 0;
 
 static void configurar_adc(void)
 {
     ADMUX = (1 << REFS0);                                   // referencia AVcc
     ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
-    DIDR0 = (1 << ADC0D) | (1 << ADC1D) | (1 << ADC2D);
+    DIDR0 = (1 << ADC0D) | (1 << ADC1D);
 }
 
 static uint16_t adc_leer(uint8_t canal)
@@ -131,7 +135,7 @@ static uint16_t adc_leer(uint8_t canal)
 static void adc_tick(void)
 {
     adc_valor[adc_canal] = adc_leer(adc_canal);
-    if (++adc_canal >= 3) adc_canal = 0;
+    if (++adc_canal >= 2) adc_canal = 0;
 }
 
 // ---------------- Entradas con antirrebote ----------------
@@ -147,7 +151,7 @@ typedef struct {
 
 enum {
     E_ESP_BAJO, E_ESP_ALTO, E_FIN_PISTON,
-    E_LASER_CAMARA, E_LASER_PRE, E_LASER_STACKER,
+    E_LASER_CAMARA, E_LASER_STACKER,
     E_AVANZAR, E_PARAR, E_RETROCEDER, E_SUBIR, E_BAJAR, E_FOTO,
     E_EMERGENCIA,
     N_ENTRADAS
@@ -156,9 +160,8 @@ enum {
 static entrada_t entradas[N_ENTRADAS] = {
     [E_ESP_BAJO]      = { &PIND, ESP_BAJO,       1 },
     [E_ESP_ALTO]      = { &PIND, ESP_ALTO,       1 },
-    [E_FIN_PISTON]    = { &PIND, FIN_PISTON,     0 },
+    [E_FIN_PISTON]    = { &PINC, FIN_PISTON,     FIN_PISTON_NC ? 1 : 0 },
     [E_LASER_CAMARA]  = { &PINC, LASER_CAMARA,   0 },
-    [E_LASER_PRE]     = { &PINC, LASER_PRE,      0 },
     [E_LASER_STACKER] = { &PINC, LASER_STACKER,  0 },
     [E_AVANZAR]       = { &PIND, BTN_AVANZAR,    0 },
     [E_PARAR]         = { &PIND, BTN_PARAR,      0 },
@@ -175,8 +178,7 @@ static uint8_t leer_crudo(uint8_t i)
 
     // Las LDR se leen por ADC: activo = laser cortado
     if (i == E_LASER_CAMARA)  return adc_valor[0] < UMBRAL_LDR;
-    if (i == E_LASER_PRE)     return adc_valor[1] < UMBRAL_LDR;
-    if (i == E_LASER_STACKER) return adc_valor[2] < UMBRAL_LDR;
+    if (i == E_LASER_STACKER) return adc_valor[1] < UMBRAL_LDR;
 
     return ((*e->pin >> e->bit) & 1) == e->nivel_activo;
 }
@@ -189,20 +191,40 @@ static void entradas_iniciar(uint32_t ahora)
     }
 }
 
+// Momento del ultimo cambio del rele: el ruido al conmutar dispara botones falsos
+static uint32_t rele_cambio = 0xFFFFFFFFUL - BLANQUEO_RELE_MS;
+
+static bool es_boton(uint8_t i)
+{
+    return i == E_FIN_PISTON || i == E_AVANZAR || i == E_PARAR || i == E_RETROCEDER ||
+           i == E_SUBIR || i == E_BAJAR || i == E_FOTO;
+}
+
 static void entradas_actualizar(uint32_t ahora)
 {
+    bool blanqueo = (uint32_t)(ahora - rele_cambio) < BLANQUEO_RELE_MS;
+
     for (uint8_t i = 0; i < N_ENTRADAS; i++) {
         entrada_t *e = &entradas[i];
         uint8_t lectura = leer_crudo(i);
 
         e->flanco = 0;
 
+        if (blanqueo && es_boton(i)) {
+            e->ultima = e->estado;
+            e->ultimo_cambio = ahora;
+            continue;
+        }
+
         if (lectura != e->ultima) {
             e->ultima = lectura;
             e->ultimo_cambio = ahora;
         }
 
-        if ((uint32_t)(ahora - e->ultimo_cambio) >= ANTIRREBOTE_MS &&
+        uint32_t espera = (i == E_LASER_CAMARA || i == E_LASER_STACKER)
+                          ? ANTIRREBOTE_LDR_MS : ANTIRREBOTE_MS;
+
+        if ((uint32_t)(ahora - e->ultimo_cambio) >= espera &&
             lectura != e->estado) {
             e->estado = lectura;
             e->flanco = lectura;
@@ -266,7 +288,7 @@ static void cinta_tick(uint32_t ahora)
 }
 
 // ---------------- Piston ----------------
-// Igual que PruebaPistonPIC: rele en bajo, minimo 3 s y se apaga con FIN_PISTON en bajo
+// Igual que PruebaPistonPIC: rele en bajo, minimo 3 s y se apaga cuando llega al fin de carrera
 static bool piston_activo = false;
 static bool piston_fallo = false;
 static uint32_t piston_inicio = 0;
@@ -274,6 +296,7 @@ static uint32_t piston_inicio = 0;
 static void piston_subir(uint32_t ahora)
 {
     PORTB &= (uint8_t)~(1 << RELE_PISTON);
+    rele_cambio = ahora;
     piston_activo = true;
     piston_fallo = false;
     piston_inicio = ahora;
@@ -281,6 +304,7 @@ static void piston_subir(uint32_t ahora)
 
 static void piston_bajar(void)
 {
+    if (!(PORTB & (1 << RELE_PISTON))) rele_cambio = tiempo_ms();
     PORTB |= (1 << RELE_PISTON);
     piston_activo = false;
 }
@@ -291,7 +315,11 @@ static void piston_tick(uint32_t ahora)
 
     uint32_t t = ahora - piston_inicio;
 
+#if USAR_FIN_PISTON
     if (t >= PISTON_MIN_MS && ACTIVA(E_FIN_PISTON)) {
+#else
+    if (t >= PISTON_MIN_MS) {
+#endif
         piston_bajar();
     } else if (t >= PISTON_MAX_MS) {
         piston_bajar();
@@ -382,8 +410,7 @@ typedef enum {
     ST_ESPERA_RESULTADO,
     ST_ACEPTADO,            // sigue de largo: espera que pase debajo del stacker
     ST_ACEPTADO_SALIENDO,
-    ST_RECHAZADO_PRE,       // cinta normal hasta el laser previo
-    ST_RECHAZADO_STACKER,   // cinta lenta hasta el laser del stacker
+    ST_RECHAZADO_STACKER,   // cinta hasta el laser del stacker
     ST_SUBIENDO,
     ST_BAJANDO,
     ST_MANUAL,
@@ -397,7 +424,7 @@ static uint8_t intentos = 0;
 
 static const char *const nombres[] = {
     "INICIO", "BUSCAR_PALLET", "PEDIR_FOTO", "ESPERA_RESULTADO",
-    "ACEPTADO", "ACEPTADO_SALIENDO", "RECHAZADO_PRE", "RECHAZADO_STACKER",
+    "ACEPTADO", "ACEPTADO_SALIENDO", "RECHAZADO_STACKER",
     "SUBIENDO", "BAJANDO", "MANUAL", "EMERGENCIA", "ERROR"
 };
 
@@ -425,7 +452,7 @@ static void debug_entradas(void)
 {
     static const char *const nombres_e[N_ENTRADAS] = {
         "ESP bajo", "ESP alto", "FIN PISTON",
-        "LASER CAMARA", "LASER PRE", "LASER STACKER",
+        "LASER CAMARA", "LASER STACKER",
         "AVANZAR", "PARAR", "RETROCEDER", "SUBIR", "BAJAR", "FOTO",
         "EMERGENCIA"
     };
@@ -518,7 +545,7 @@ static void ejecutar_secuencia(uint32_t ahora)
         } else if (cod == COD_RECHAZADO) {
             pitidos(2, ahora);
             cinta(CINTA_ADELANTE, VEL_NORMAL);
-            cambiar(ST_RECHAZADO_PRE, ahora);
+            cambiar(ST_RECHAZADO_STACKER, ahora);
         } else if (t >= RESULTADO_MS) {
             if (++intentos < REINTENTOS_FOTO) {
                 foto_pedir(ahora);
@@ -541,15 +568,6 @@ static void ejecutar_secuencia(uint32_t ahora)
         // Cuando el pallet termino de pasar debajo del stacker, se busca el proximo
         if (!ACTIVA(E_LASER_STACKER)) {
             cambiar(ST_BUSCAR_PALLET, ahora);
-        } else if (t >= TRAYECTO_MS) {
-            ir_a_error(ahora);
-        }
-        break;
-
-    case ST_RECHAZADO_PRE:
-        if (ACTIVA(E_LASER_PRE)) {
-            cinta(CINTA_ADELANTE, VEL_LENTA);
-            cambiar(ST_RECHAZADO_STACKER, ahora);
         } else if (t >= TRAYECTO_MS) {
             ir_a_error(ahora);
         }
@@ -630,18 +648,18 @@ static void configurar_pines(void)
     PORTD &= (uint8_t)~((1 << ESP_BAJO) | (1 << ESP_ALTO));
 
     // Resto de entradas con pull-up
-    DDRD &= (uint8_t)~((1 << FIN_PISTON) | (1 << BTN_AVANZAR) | (1 << BTN_PARAR));
-    PORTD |= (1 << FIN_PISTON) | (1 << BTN_AVANZAR) | (1 << BTN_PARAR);
+    DDRD &= (uint8_t)~((1 << BTN_AVANZAR) | (1 << BTN_PARAR));
+    PORTD |= (1 << BTN_AVANZAR) | (1 << BTN_PARAR);
 
     DDRB &= (uint8_t)~((1 << BTN_RETROCEDER) | (1 << BTN_SUBIR) | (1 << BTN_BAJAR));
     PORTB |= (1 << BTN_RETROCEDER) | (1 << BTN_SUBIR) | (1 << BTN_BAJAR);
 
-    DDRC &= (uint8_t)~((1 << BTN_FOTO) | (1 << BTN_EMERGENCIA));
-    PORTC |= (1 << BTN_FOTO) | (1 << BTN_EMERGENCIA);
+    DDRC &= (uint8_t)~((1 << FIN_PISTON) | (1 << BTN_FOTO) | (1 << BTN_EMERGENCIA));
+    PORTC |= (1 << FIN_PISTON) | (1 << BTN_FOTO) | (1 << BTN_EMERGENCIA);
 
     // LDR: entradas sin pull-up (tienen su resistencia de 10 kohm a GND)
-    DDRC &= (uint8_t)~((1 << LASER_CAMARA) | (1 << LASER_PRE) | (1 << LASER_STACKER));
-    PORTC &= (uint8_t)~((1 << LASER_CAMARA) | (1 << LASER_PRE) | (1 << LASER_STACKER));
+    DDRC &= (uint8_t)~((1 << LASER_CAMARA) | (1 << LASER_STACKER));
+    PORTC &= (uint8_t)~((1 << LASER_CAMARA) | (1 << LASER_STACKER));
 }
 
 int main(void)
@@ -655,7 +673,7 @@ int main(void)
 
     uart_texto("Clasificadora iniciada\r\n");
 
-    for (uint8_t i = 0; i < 3; i++) adc_tick();
+    for (uint8_t i = 0; i < 2; i++) adc_tick();
 
     uint32_t ultimo = tiempo_ms();
     entradas_iniciar(ultimo);
